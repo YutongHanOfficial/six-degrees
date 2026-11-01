@@ -105,12 +105,15 @@ class Graph:
         self._sides = (_Side(self.P, self.C), _Side(self.P, self.C))
 
     # ------------------------------------------------------------ search
-    def connect(self, src: int, dst: int, allowed, avoid=(), k: int = 3, max_degrees: int = 12):
+    def connect(self, src: int, dst: int, allowed, avoid=(), k: int = 3, max_degrees: int | None = None):
         """Shortest connections from src to dst.
 
         allowed: bool array indexed by category code. avoid: person ids the route must not use.
         Returns dict(degrees, paths=[(people, links)], visited, ms); degrees is None if unreachable.
         A path's links[i] joins people[i] and people[i+1]: -1 = direct relation, else context id.
+        With no max_degrees the search runs until the two sides meet or one runs out of people
+        (bounded by the size of the graph); in that case ran_out is "from" or "to" and reached is
+        how many other people that side could reach.
         """
         allowed = np.asarray(allowed, bool)
         t0 = time.time()
@@ -135,7 +138,7 @@ class Graph:
             for side in (S, T):
                 side.dist[blocked] = BLOCKED
                 side.touched.append(blocked)
-        while S.frontier.size and T.frontier.size and S.depth + T.depth < max_degrees:
+        while S.frontier.size and T.frontier.size and (max_degrees is None or S.depth + T.depth < max_degrees):
             if self.cost[S.frontier].sum() <= self.cost[T.frontier].sum():
                 side, other = S, T
             else:
@@ -144,7 +147,12 @@ class Graph:
             hits = new[other.dist[new] >= 0]
             if hits.size:
                 return {"degrees": S.depth + T.depth, "paths": self._paths(S, T, hits, k)}
-        return {"degrees": None, "paths": []}
+        out = {"degrees": None, "paths": []}
+        for side, end in ((S, "from"), (T, "to")):
+            if not side.frontier.size:  # everyone reachable from this end has been checked
+                out["ran_out"] = end
+                out["reached"] = int(sum(t.size for t in side.touched)) - blocked.size - 1
+        return out
 
     def _expand(self, side: _Side, allowed) -> np.ndarray:
         F, depth = side.frontier, side.depth

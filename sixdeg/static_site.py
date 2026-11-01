@@ -29,6 +29,7 @@ from __future__ import annotations
 import array
 import csv
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -597,17 +598,21 @@ def export_site(data_dir: str, out_dir: str, web: bool = True) -> None:
 
 
 def copy_web(out_dir: str, version: str) -> None:
-    """The web app, with engine.js switched on. Asset URLs carry the data version so browsers
-    pick up a new build instead of a cached old one."""
+    """The web app, with engine.js switched on. Asset URLs carry the data version and a hash of
+    the web files, so browsers pick up a new build or new code instead of a cached old copy
+    (GitHub Pages lets browsers keep files for 10 minutes), and never mix old and new files."""
+    texts = {}
     for name in WEB_FILES:
         with open(os.path.join(WEB_DIR, name), encoding="utf-8") as f:
-            text = f.read()
+            texts[name] = f.read()
+    tag = f"{version}-{hashlib.sha1(''.join(texts.values()).encode()).hexdigest()[:8]}"
+    for name, text in texts.items():
         if name == "index.html":
             text = text.replace('<script src="app.js"></script>',
-                                f'<script>window.SIXDEG_STATIC = {{ data: "data/", version: "{version}" }};</script>\n'
-                                f'  <script src="engine.js?v={version}"></script>\n'
-                                f'  <script src="app.js?v={version}"></script>')
-            text = text.replace('href="style.css"', f'href="style.css?v={version}"')
+                                f'<script>window.SIXDEG_STATIC = {{ data: "data/", version: "{version}", web: "{tag}" }};</script>\n'
+                                f'  <script src="engine.js?v={tag}"></script>\n'
+                                f'  <script src="app.js?v={tag}"></script>')
+            text = text.replace('href="style.css"', f'href="style.css?v={tag}"')
         with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
             f.write(text)
     # GitHub Pages would otherwise run the files through Jekyll

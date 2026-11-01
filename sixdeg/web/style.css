@@ -178,7 +178,10 @@ main { max-width: 920px; margin: 0 auto; padding: 12px 20px 40px; }
 }
 .notice.err { border-color: color-mix(in srgb, #dc2626 45%, var(--border)); color: var(--text); }
 .loading { display: flex; align-items: center; gap: 12px; color: var(--muted); }
-.spinner { width: 18px; height: 18px; border-radius: 50%; border: 2.5px solid var(--border); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+.loading .msg { flex: 1; min-width: 0; }
+.loading .stop { flex: none; font-size: 13.5px; padding: 6px 14px; }
+.loading .stop:hover { color: #dc2626; border-color: #dc2626; }
+.spinner { flex: none; width: 18px; height: 18px; border-radius: 50%; border: 2.5px solid var(--border); border-top-color: var(--accent); animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .chain { list-style: none; margin: 0; padding: 0; position: relative; }

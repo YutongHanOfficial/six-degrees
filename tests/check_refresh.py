@@ -1,0 +1,44 @@
+"""Refuses to publish a data refresh that lost a lot of data, a sign that a download went wrong.
+
+  python3 tests/check_refresh.py live/meta.json site/data/meta.json [--allow-drop 0.05]
+
+Compares the stats of the published site with the new export, and exits 1 if people, relations,
+contexts or memberships dropped by more than the allowed fraction. Wikidata only grows from month
+to month, so a real drop that large means a query came back short.
+"""
+import argparse
+import json
+import sys
+
+KEYS = ("people", "relations", "contexts", "memberships")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("live", help="meta.json of the published site")
+    ap.add_argument("new", help="meta.json of the new export")
+    ap.add_argument("--allow-drop", type=float, default=0.05, help="largest allowed drop (default 0.05 = 5%%)")
+    args = ap.parse_args()
+    try:
+        with open(args.live) as f:
+            live = json.load(f)["stats"]
+    except (OSError, ValueError, KeyError):
+        print("nothing published yet to compare with")
+        return 0
+    with open(args.new) as f:
+        new = json.load(f)["stats"]
+    print(f"published {live['built_at']}, new {new['built_at']}")
+    shrunk = []
+    for k in KEYS:
+        change = new[k] / live[k] - 1
+        print(f"  {k:12s} {live[k]:>12,} -> {new[k]:>12,}  ({change:+.1%})")
+        if change < -args.allow_drop:
+            shrunk.append(k)
+    if shrunk:
+        print(f"not publishing: {', '.join(shrunk)} dropped by more than {args.allow_drop:.0%}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

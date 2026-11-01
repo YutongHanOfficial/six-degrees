@@ -4,7 +4,7 @@
    read out of the big data files with HTTP range requests; the connection search itself runs in
    worker.js. Sentences are ports of sixdeg/store.py.
 
-   window.SixDeg = { call(path, params), network, onNetwork(callback) } */
+   window.SixDeg = { call(path, params, opts), network, onNetwork(callback) } */
 (function () {
   const CFG = window.SIXDEG_STATIC;
   if (!CFG) return;
@@ -347,7 +347,7 @@
         pending.clear();
       };
       if (typeof DecompressionStream === "undefined") return fail("This browser is too old for the search (it needs DecompressionStream).");
-      worker = new Worker(new URL(`worker.js?v=${V}`, location.href));
+      worker = new Worker(new URL(`worker.js?v=${CFG.web || V}`, location.href));
       worker.onmessage = (e) => {
         const d = e.data;
         if (d.type === "progress") {
@@ -359,6 +359,8 @@
           resolve();
         } else if (d.type === "error") {
           fail(d.error);
+        } else if (d.type === "searching") {
+          pending.get(d.id)?.onProgress?.({ degrees: d.degrees, visited: d.visited });
         } else if (d.type === "result") {
           const p = pending.get(d.id);
           pending.delete(d.id);
@@ -370,18 +372,28 @@
     })));
   }
 
-  async function graphConnect(args) {
-    await startNetwork();
+  // Rejects with an AbortError as soon as `signal` fires (also while the network is still
+  // downloading); the worker drops the search at its next pause.
+  async function graphConnect(args, { signal, onProgress } = {}) {
+    const stopped = new Promise((_, reject) => {
+      const stop = () => reject(Object.assign(new Error("Search stopped"), { name: "AbortError" }));
+      if (signal?.aborted) stop(); else signal?.addEventListener("abort", stop, { once: true });
+    });
+    stopped.catch(() => {});
+    await Promise.race([startNetwork(), stopped]);
     const id = ++seq;
-    return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+    const answer = new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject, onProgress });
       worker.postMessage({ type: "connect", id, ...args });
     });
+    stopped.catch(() => { if (pending.delete(id)) worker.postMessage({ type: "cancel", id }); });
+    return Promise.race([answer, stopped]);
   }
 
   /* ---------------------------------------------------------- API */
 
-  async function apiConnect(q) {
+  // opts: { signal (AbortSignal), onProgress({ degrees, visited }) } -- see graphConnect
+  async function apiConnect(q, opts) {
     const [A, B] = await Promise.all([resolve(q.from), resolve(q.to)]);
     if (!A || !B) throw new Error(`No person found for “${!A ? q.from : q.to}”.`);
     const m = await meta();
@@ -390,20 +402,20 @@
     const chosen = q.cats ? new Set(String(q.cats).split(",").filter((k) => keys.includes(k)))
       : new Set(m.categories.filter((c) => c.default).map((c) => c.key));
     const avoid = (await Promise.all(String(q.avoid || "").split(",").filter(Boolean).map(byQid))).filter(Boolean);
-    const maxDegrees = 12;
     const res = await graphConnect({
       src: A.id, dst: B.id, allowed: keys.map((k) => chosen.has(k)), avoid: avoid.map((p) => p.id),
-      k: Math.min(Number(q.k) || 4, 10), maxDegrees,
-    });
+      k: Math.min(Number(q.k) || 4, 10),
+    }, opts);
     const out = { from: A, to: B, degrees: res.degrees, ms: res.ms, visited: res.visited,
                   categories: [...chosen].sort(), avoid, paths: [] };
     if (res.degrees === null) {
       const lonely = [A, B].filter((p) => p.n_relations + p.n_contexts === 0).map((p) => p.name);
       out.reason = lonely.length
         ? `${lonely.join(" and ")} ${lonely.length === 1 ? "has" : "have"} no recorded connections in the database.`
-        : `No route within ${maxDegrees} degrees using the selected link types.`;
+        : noRoute(res.ranOut === "to" ? B : A, res.ranOut === "to" ? A : B, res.reached, avoid.length > 0);
       return out;
     }
+    opts?.onProgress?.({ found: res.degrees, visited: res.visited });
     const cardsP = cardsFor(res.paths.flatMap((p) => p.people));  // fetched alongside the link details
     out.paths = await Promise.all(res.paths.map(async (p) => {
       const links = await Promise.all(p.links.map((via, i) => explainLink(p.people[i], p.people[i + 1], via, chosen, cardsP, labels)));
@@ -411,6 +423,14 @@
       return { people: p.people.map((id) => cards.get(id)), links };
     }));
     return out;
+  }
+
+  // The search reached everyone `who` is connected to (with these settings) without finding `other`
+  // (server.py no_route)
+  function noRoute(who, other, reached, avoiding) {
+    if (!reached) return `None of ${who.name}'s links can be used with these ${avoiding ? "settings" : "link types"}.`;
+    return `${who.name}'s whole network is ${reached.toLocaleString("en-US")} other ${reached === 1 ? "person" : "people"}, ` +
+      `and ${other.name} isn't one of them.`;
   }
 
   // A person's direct connections, grouped by link type (store.neighborhood)
@@ -488,11 +508,11 @@
     network,
     onNetwork(f) { listeners.add(f); f(network); return () => listeners.delete(f); },
     startNetwork,
-    async call(path, params = {}) {
+    async call(path, params = {}, opts = {}) {
       switch (path) {
         case "/api/stats": return apiStats();
         case "/api/search": return search(params.q, Math.min(Number(params.limit) || 8, 25));
-        case "/api/connect": return apiConnect(params);
+        case "/api/connect": return apiConnect(params, opts);
         case "/api/person": return apiPerson(params);
         case "/api/random": return apiRandom();
         default: throw new Error("unknown request " + path);

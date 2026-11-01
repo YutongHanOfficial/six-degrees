@@ -91,9 +91,13 @@ def main():
                 src, dst = rng.randrange(P), rng.randrange(P)
                 avoid = set(rng.sample(range(P), rng.randrange(0, 3))) - {src, dst}
                 ref, adj = reference(P, direct, member, c_cat, allowed, src, avoid)
-                res = g.connect(src, dst, allowed, sorted(avoid), k=4, max_degrees=50)
+                res = g.connect(src, dst, allowed, sorted(avoid), k=4)
                 want = ref.get(dst)
                 assert res["degrees"] == want, (trial, src, dst, res["degrees"], want)
+                if want is None:  # no route: one side must have reached everyone it can
+                    end = src if res["ran_out"] == "from" else dst
+                    reach, _ = reference(P, direct, member, c_cat, allowed, end, avoid)
+                    assert res["reached"] == len(reach) - 1, (trial, src, dst, res["reached"], len(reach) - 1)
                 for people, links in res["paths"]:
                     assert people[0] == src and people[-1] == dst
                     assert len(people) == want + 1 and len(links) == want

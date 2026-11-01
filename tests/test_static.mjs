@@ -66,14 +66,18 @@ async function testGraph(refs) {
   const run = vm.runInContext("({ connect, gidOf, G })", w.ctx);
   const BONUS = [1.5, 1, 1, 1, 1, 1, 1, 1, 0.5, 0, 0];
   const keys = meta.categories.map((c) => c.key);
-  let ms = 0;
+  let ms = 0, unreachable = 0, longest = 0;
   for (const ref of refs) {
     const allowed = keys.map((k) => ref.cats.includes(k));
-    const r = run.connect({ src: ref.src, dst: ref.dst, allowed, avoid: ref.avoid, k: 3, maxDegrees: 12 });
+    const r = await run.connect({ src: ref.src, dst: ref.dst, allowed, avoid: ref.avoid, k: 3 });
     ms += r.ms;
     const what = `${ref.src}->${ref.dst} [${ref.cats}] avoid ${ref.avoid}`;
     check("degrees", r.degrees === ref.degrees, `${what}: ${r.degrees} vs ${ref.degrees}`);
     check("visited", r.visited === ref.visited, `${what}: ${r.visited} vs ${ref.visited}`);
+    check("ran out", (r.ranOut ?? null) === ref.ran_out && (r.reached ?? null) === ref.reached,
+          `${what}: ${r.ranOut} ${r.reached} vs ${ref.ran_out} ${ref.reached}`);
+    if (ref.degrees === null) unreachable++;
+    else longest = Math.max(longest, ref.degrees);
     if (ref.degrees && r.paths.length) {
       const { G } = run;
       const g = r.paths[0].people.map(run.gidOf);
@@ -93,7 +97,34 @@ async function testGraph(refs) {
       check("route length", r.paths[0].people.length === ref.degrees + 1, what);
     }
   }
-  console.log(`${refs.length} graph searches compared (${(ms / refs.length).toFixed(0)} ms average)`);
+  console.log(`${refs.length} graph searches compared (${(ms / refs.length).toFixed(0)} ms average; ` +
+              `longest route ${longest} degrees, ${unreachable} pairs not connected at all)`);
+
+  // A search stopped part-way leaves nothing behind: stop the slowest one after its first pause,
+  // then run every search again and check it still agrees.
+  const slow = refs.reduce((a, b) => (b.visited > a.visited ? b : a));
+  const allowedOf = (ref) => keys.map((k) => ref.cats.includes(k));
+  let reports = 0;
+  const stopped = await run.connect({ src: slow.src, dst: slow.dst, allowed: allowedOf(slow), avoid: slow.avoid, k: 3, pauseMs: 0 },
+                                    () => reports++, () => true);
+  check("stop", stopped === null && reports === 1, `${stopped} after ${reports} reports`);
+  for (const ref of refs.slice(0, 60)) {
+    const r = await run.connect({ src: ref.src, dst: ref.dst, allowed: allowedOf(ref), avoid: ref.avoid, k: 3 });
+    check("after a stop", r.degrees === ref.degrees && r.visited === ref.visited, `${ref.src}->${ref.dst}`);
+  }
+
+  // through the worker's messages: progress reports, then the answer, or nothing once cancelled
+  const got = [];
+  w.onmessage = (e) => got.push(e.data);
+  const msg = { type: "connect", src: slow.src, dst: slow.dst, allowed: allowedOf(slow), avoid: slow.avoid, k: 3, pauseMs: 0 };
+  w.postMessage({ ...msg, id: 1 });
+  w.postMessage({ ...msg, id: 2 });
+  w.postMessage({ type: "cancel", id: 2 });
+  while (got.filter((m) => m.type === "result").length < 2) await new Promise((r) => setTimeout(r, 5));
+  const r1 = got.find((m) => m.type === "result" && m.id === 1), r2 = got.find((m) => m.type === "result" && m.id === 2);
+  check("worker answer", r1.result && r1.result.degrees === slow.degrees && r1.result.visited === slow.visited);
+  check("worker progress", got.some((m) => m.type === "searching" && m.id === 1));
+  check("worker cancel", r2.cancelled === true && !got.some((m) => m.type === "searching" && m.id === 2));
 }
 
 /* ---------------------------------------------------------- 2. engine vs the Python API */
@@ -115,6 +146,13 @@ async function testEngine(app) {
   }
   console.log(`name search: ${same} of ${app.search.length} queries give the same top 8 as SQLite FTS`);
   check("name search agreement", same >= app.search.length * 0.85, `${same}/${app.search.length}`);
+
+  // a stopped search rejects with an AbortError, and leaves the next one unaffected
+  const ctl = new AbortController(), first = app.connect[0];
+  const stopped = api.call("/api/connect", { from: first.from, to: first.to, k: 4 }, { signal: ctl.signal });
+  ctl.abort();
+  const err = await stopped.then(() => null, (e) => e);
+  check("abort", err && err.name === "AbortError", String(err));
 
   for (const ref of app.connect) {
     const r = await api.call("/api/connect", { from: ref.from, to: ref.to, k: 4 });

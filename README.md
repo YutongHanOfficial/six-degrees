@@ -72,6 +72,15 @@ Then turn on Pages for the repository (Settings → Pages → Deploy from a bran
 After a data `update`, run `site` and `deploy` again; `deploy` replaces the branch with a single
 commit, so old data doesn't accumulate in the repository.
 
+### Monthly refresh
+
+`.github/workflows/refresh.yml` does all of that on GitHub's machines on the 3rd of every month
+(free for public repositories): `update`, `site`, the browser-vs-Python tests below, a check that
+the new data isn't more than 5% smaller than what is live (a sign that a download came back
+short), then `deploy`. If any step fails the live site stays as it was and GitHub emails you. A run
+takes 2–3 hours; start one by hand from the Actions tab ("Monthly data refresh" → "Run workflow"),
+and turn it off there too ("…" → "Disable workflow").
+
 How it works without a server:
 
 - **The connection search runs in the visitor's browser.** The graph (who is linked to whom) is
@@ -139,6 +148,15 @@ it picks the one through the best-known people (scored by how many Wikipedia lan
 cover them) and the most recognisable links, and lists other equally short routes as alternatives.
 "Avoid" re-runs the search with a person excluded.
 
+There is no limit on the number of degrees. Each person is visited at most once from each side,
+so a search ends after at most one pass over the graph: either the two sides meet, or one of them
+runs out of people, which proves there is no connection at all ("X's whole network is 70 other
+people, and Y isn't one of them"). Two well-known people are typically about 5 degrees apart and
+two random people about 9, but about a quarter of connected random pairs are more than 12 apart,
+and long family trees make some much further: Ramesses III → Philip Sidney is 58 degrees, through Assyrian kings,
+Hillel, Paul the Apostle and Mary I. On the website a long search shows its progress and has a
+Stop button; `connect --max N` gives up beyond N degrees.
+
 ## The database (`data/people.db`)
 
 Plain SQLite, so you can query it directly:
@@ -200,4 +218,6 @@ sixdeg/web/engine.js    the website's in-browser stand-in for the JSON API
 sixdeg/web/worker.js    the website's connection search (port of graph.py)
 tests/test_graph.py  search vs. brute-force BFS on random graphs
 tests/test_static.mjs   browser code vs. the Python app (with tests/static_reference.py)
+tests/check_refresh.py  refuses to publish a refresh that lost a lot of data
+.github/workflows/refresh.yml   the monthly refresh
 ```

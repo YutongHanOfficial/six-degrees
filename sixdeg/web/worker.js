@@ -11,33 +11,45 @@
 const f32 = Math.fround;
 const ROOT = -0x80000000;  // lnk[] of a start node; otherwise lnk[] >= 0 is the context a node was
                            // reached through (parent = cpar[ctx]), and < 0 is -(parent + 1) for a direct link
-const BLOCKED = 100;       // dist[] of avoided people
+const BLOCKED = 32000;     // dist[] of avoided people (as in graph.py)
+const PAUSE_MS = 50;       // a long search pauses this often, to report progress and hear "cancel"
 // score bonus for a direct link, by category code (graph.py DIRECT_BONUS)
 const BONUS = new Float32Array([1.5, 1, 1, 1, 1, 1, 1, 1, 0.5, 0, 0]);
 
 let G = null;
 let ready = null;
+let queue = Promise.resolve();  // searches run one at a time: they share the per-side arrays
+const cancelled = new Set();    // ids of searches the page has given up on
 
-self.onmessage = async (e) => {
+self.onmessage = (e) => {
   const msg = e.data;
   if (msg.type === "load") {
     ready = load(msg).catch((err) => {
       post({ type: "error", error: err instanceof RangeError ? "Not enough memory on this device to load the network." : String(err.message || err) });
       throw err;
     });
-    return;
-  }
-  if (msg.type === "connect") {
-    try {
-      await ready;
-      post({ type: "result", id: msg.id, result: connect(msg) });
-    } catch (err) {
-      post({ type: "result", id: msg.id, error: String(err.message || err) });
-    }
+  } else if (msg.type === "cancel") {
+    cancelled.add(msg.id);
+  } else if (msg.type === "connect") {
+    queue = queue.then(() => search(msg));
   }
 };
 
 function post(m) { self.postMessage(m); }
+
+async function search(msg) {
+  const { id } = msg;
+  try {
+    await ready;
+    const result = cancelled.has(id) ? null
+      : await connect(msg, (p) => post({ type: "searching", id, ...p }), () => cancelled.has(id));
+    post(result ? { type: "result", id, result } : { type: "result", id, cancelled: true });
+  } catch (err) {
+    post({ type: "result", id, error: String(err.message || err) });
+  } finally {
+    for (const x of cancelled) if (x <= id) cancelled.delete(x);  // ids only grow
+  }
+}
 
 /* ------------------------------------------------------------ loading */
 
@@ -219,7 +231,7 @@ function decodeDirect(bytes, L, D) {
 
 function newSide(L, C) {
   return {
-    dist: new Int8Array(L).fill(-1),
+    dist: new Int16Array(L).fill(-1),
     lnk: new Int32Array(L),
     best: new Float32Array(L),
     cseen: new Uint8Array(C),   // 0 never, 2 entered at the current level, 1 entered earlier
@@ -250,11 +262,18 @@ function gidOf(dbId) {
   return -1;
 }
 
-function connect({ src, dst, allowed, avoid = [], k = 3, maxDegrees = 12 }) {
+// There is no limit on the number of degrees: the search ends when the two sides meet or one of
+// them runs out of people, so it can never take longer than one pass over the graph. Every
+// PAUSE_MS it reports progress and lets messages in; if stop() then says the page has given up,
+// it returns null.
+async function connect({ src, dst, allowed, avoid = [], k = 3, maxDegrees = Infinity, pauseMs = PAUSE_MS },
+                       report = () => {}, stop = () => false) {
   const t0 = performance.now();
   if (src === dst) return { degrees: 0, paths: [{ people: [src], links: [] }], visited: 0, ms: 0 };
   const s = gidOf(src), t = gidOf(dst);
-  if (s < 0 || t < 0) return { degrees: null, paths: [], visited: 2, ms: 0 };  // someone with no links
+  if (s < 0 || t < 0) {  // someone with no links: that side runs dry at once (it is expanded first)
+    return { degrees: null, paths: [], visited: 2, ms: 0, ranOut: s < 0 ? "from" : "to", reached: 0 };
+  }
   const okCat = Uint8Array.from(allowed, Boolean);
   const [S, T] = G.sides;
   let out = { degrees: null, paths: [] };
@@ -266,6 +285,7 @@ function connect({ src, dst, allowed, avoid = [], k = 3, maxDegrees = 12 }) {
       if (v < 0 || v === s || v === t) continue;
       for (const side of [S, T]) { side.dist[v] = BLOCKED; side.blocked.push(v); }
     }
+    let pause = t0 + pauseMs;
     while (S.fEnd > S.fStart && T.fEnd > T.fStart && S.depth + T.depth < maxDegrees) {
       const [side, other] = frontierCost(S) <= frontierCost(T) ? [S, T] : [T, S];
       expand(side, okCat);
@@ -278,8 +298,20 @@ function connect({ src, dst, allowed, avoid = [], k = 3, maxDegrees = 12 }) {
         out = { degrees: S.depth + T.depth, paths: paths(S, T, hits, k) };
         break;
       }
+      if (performance.now() >= pause) {
+        // no route of up to `degrees` links exists: every one would have met in the middle by now
+        report({ degrees: S.depth + T.depth, visited: visitedCount(S, T) });
+        await new Promise((r) => setTimeout(r, 0));
+        if (stop()) return null;
+        pause = performance.now() + pauseMs;
+      }
     }
-    out.visited = S.fEnd + S.blocked.length + T.fEnd + T.blocked.length;
+    if (out.degrees === null) {
+      // one side ran dry: everyone reachable from that person has been checked
+      const dry = S.fEnd === S.fStart ? S : T.fEnd === T.fStart ? T : null;
+      if (dry) Object.assign(out, { ranOut: dry === S ? "from" : "to", reached: dry.fEnd - 1 });
+    }
+    out.visited = visitedCount(S, T);
   } finally {
     reset(S);
     reset(T);
@@ -288,6 +320,8 @@ function connect({ src, dst, allowed, avoid = [], k = 3, maxDegrees = 12 }) {
   out.ms = Math.round(performance.now() - t0);
   return out;
 }
+
+const visitedCount = (S, T) => S.fEnd + S.blocked.length + T.fEnd + T.blocked.length;
 
 function start(side, node) {
   side.dist[node] = 0;

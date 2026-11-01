@@ -97,7 +97,8 @@ def main():
 def _ref(g, src, dst, cats, avoid, mask, r):
     best = r["paths"][0] if r["paths"] else None
     return {"src": src, "dst": dst, "cats": cats, "avoid": avoid, "degrees": r["degrees"], "visited": r["visited"],
-            "score": path_score(g, best[0], best[1], mask) if best else None, "path": best[0] if best else None}
+            "score": path_score(g, best[0], best[1], mask) if best else None, "path": best[0] if best else None,
+            "ran_out": r.get("ran_out"), "reached": r.get("reached")}
 
 
 if __name__ == "__main__":

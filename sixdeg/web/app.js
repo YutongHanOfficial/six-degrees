@@ -17,11 +17,12 @@ const state = {
 // On a static host (see `sixdeg.py site`) engine.js answers these in the browser.
 const engine = window.SixDeg || null;
 
-async function api(path, params = {}) {
-  if (engine) return engine.call(path, params);
+// opts: { signal, onProgress } -- a search can be stopped; only the static engine reports progress
+async function api(path, params = {}, opts = {}) {
+  if (engine) return engine.call(path, params, opts);
   const url = new URL(path, location.origin);
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, v);
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: opts.signal });
   const body = await res.json().catch(() => ({ error: res.statusText }));
   if (!res.ok || body.error) throw new Error(body.error || res.statusText);
   return body;
@@ -159,6 +160,15 @@ $("#cats").addEventListener("click", (e) => {
 /* ------------------------------------------------------------ search */
 
 let searchSeq = 0;
+let running = null;  // AbortController of the search in progress
+
+const degreesText = (n) => `${n} degree${n === 1 ? "" : "s"}`;
+
+// what a long search has done so far ({degrees, visited}), or that it is done ({found})
+function progressText(p) {
+  if (p.found != null) return `Found a connection: ${degreesText(p.found)}. Writing it up…`;
+  return `Still searching: no connection within ${degreesText(p.degrees)} so far · ${fmt(p.visited)} people checked`;
+}
 
 // Static site: the network the search runs on is downloaded once, then cached by the browser.
 function networkText(n) {
@@ -178,22 +188,37 @@ if (engine) {
   });
 }
 
+// There's no limit on the degrees: the search runs until it finds the shortest route or has
+// checked everyone either person can reach, and the Stop button ends it early.
 async function go() {
   if (!(state.from && state.to)) return;
+  if (running) running.abort();  // a new search replaces one still going
+  const ctl = (running = new AbortController());
   const mine = ++searchSeq;
   writeHash();
   const out = $("#result");
-  out.innerHTML = `<div class="notice loading"><span class="spinner"></span><span class="msg">Searching for the shortest connection…</span></div>`;
-  const stop = engine && !engine.network.ready
+  out.innerHTML = `<div class="notice loading"><span class="spinner"></span>
+    <span class="msg" aria-live="off">Searching for the shortest connection…</span>
+    <button type="button" class="mini-btn stop">Stop</button></div>`;
+  const msg = $(".msg", out), stopBtn = $(".stop", out);
+  stopBtn.addEventListener("click", () => ctl.abort());
+  let last = null;  // the latest progress report
+  const unwatch = engine && !engine.network.ready
     ? engine.onNetwork((n) => {
-      const msg = $(".msg", out);
-      if (msg && !n.ready && !n.error) msg.textContent = `${networkText(n)} — only the first search waits for this…`;
+      if (!n.ready && !n.error) msg.textContent = `${networkText(n)} — only the first search waits for this…`;
     })
     : null;
   try {
     const res = await api("/api/connect", {
       from: state.from.qid, to: state.to.qid, k: 6,
       cats: [...state.cats].join(","), avoid: state.avoid.map((p) => p.qid).join(","),
+    }, {
+      signal: ctl.signal,
+      onProgress: (p) => {
+        last = p;
+        msg.textContent = progressText(p);
+        if (p.found != null) stopBtn.hidden = true;  // only the write-up is left
+      },
     });
     if (mine !== searchSeq) return;
     state.result = res;
@@ -201,9 +226,12 @@ async function go() {
     renderResult();
   } catch (e) {
     if (mine !== searchSeq) return;
-    out.innerHTML = `<div class="notice err">${esc(e.message)}</div>`;
+    out.innerHTML = e.name !== "AbortError" ? `<div class="notice err">${esc(e.message)}</div>`
+      : `<div class="notice"><strong>Search stopped.</strong>
+          ${last ? `There's no connection within ${degreesText(last.degrees)} (${fmt(last.visited)} people checked).` : ""}</div>`;
   } finally {
-    if (stop) stop();
+    if (unwatch) unwatch();
+    if (running === ctl) running = null;
   }
 }
 
@@ -231,8 +259,11 @@ function renderResult() {
   const out = $("#result");
   if (!res) { out.innerHTML = ""; return; }
   if (res.degrees === null) {
+    const tries = [];
+    if (state.cats.size < state.categories.length) tries.push("switching on more link types");
+    if (state.avoid.length) tries.push(`no longer avoiding ${state.avoid.map((p) => p.name).join(" and ")}`);
     out.innerHTML = `<div class="notice"><strong>No connection found.</strong> ${esc(res.reason || "")}
-      ${state.cats.size < state.categories.length ? " Try switching on more link types." : ""}</div>`;
+      ${tries.length ? esc(` Try ${tries.join(" or ")}.`) : ""}</div>`;
     return;
   }
   if (res.degrees === 0) {

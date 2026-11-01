@@ -254,7 +254,7 @@ def main():
     p.add_argument("--exclude", help="drop link types")
     p.add_argument("--avoid", nargs="*", help="people the route must not pass through")
     p.add_argument("-k", type=int, default=4, help="how many alternative routes to list")
-    p.add_argument("--max", type=int, default=12, help="give up beyond this many degrees")
+    p.add_argument("--max", type=int, help="give up beyond this many degrees (default: no limit)")
     p.set_defaults(func=cmd_connect)
 
     p = sub.add_parser("search", help="look people up by name")

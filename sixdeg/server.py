@@ -35,7 +35,7 @@ class App:
         mask = np.array([k in chosen for k in keys], bool)
         return chosen, mask
 
-    def connect(self, a_text, b_text, cats_value=None, avoid_value="", k=3, max_degrees=12):
+    def connect(self, a_text, b_text, cats_value=None, avoid_value="", k=3, max_degrees=None):
         A = self.store.person_by_qid(a_text) or self.store.resolve(a_text)
         B = self.store.person_by_qid(b_text) or self.store.resolve(b_text)
         if not A or not B:
@@ -52,9 +52,14 @@ class App:
                "categories": sorted(cats), "avoid": avoid, "paths": []}
         if res["degrees"] is None:
             lonely = [p["name"] for p in (A, B) if p["n_relations"] + p["n_contexts"] == 0]
-            out["reason"] = (f"{' and '.join(lonely)} {'has' if len(lonely) == 1 else 'have'} no recorded "
-                             "connections in the database." if lonely else
-                             f"No route within {max_degrees} degrees using the selected link types.")
+            if lonely:
+                out["reason"] = (f"{' and '.join(lonely)} {'has' if len(lonely) == 1 else 'have'} no recorded "
+                                 "connections in the database.")
+            elif "ran_out" in res:
+                who, other = (B, A) if res["ran_out"] == "to" else (A, B)
+                out["reason"] = no_route(who, other, res["reached"], bool(avoid))
+            else:
+                out["reason"] = f"No route within {max_degrees} degrees using the selected link types."
             return out
         ids = {n for people, _ in res["paths"] for n in people}
         cards = self.store.people(ids)
@@ -64,6 +69,14 @@ class App:
                 "links": self.store.explain(people, links, cats, cards),
             })
         return out
+
+
+def no_route(who: dict, other: dict, reached: int, avoiding: bool) -> str:
+    """The search reached everyone `who` is connected to (with these settings) without finding `other`."""
+    if not reached:
+        return f"None of {who['name']}'s links can be used with these {'settings' if avoiding else 'link types'}."
+    return (f"{who['name']}'s whole network is {reached:,} other {'person' if reached == 1 else 'people'}, "
+            f"and {other['name']} isn't one of them.")
 
 
 def make_handler(app: App):
