@@ -1,7 +1,7 @@
 "use strict";
 /* The search graph in a Web Worker: the static site's version of sixdeg/graph.py.
 
-   Downloads the graph-*.bin files written by `sixdeg.py site` (keeping them in the Cache API, so
+   Downloads the graph-*.gz files written by `sixdeg.py site` (keeping them in the Cache API, so
    it happens once per data version), rebuilds the same CSR arrays, and runs the same
    level-synchronous bidirectional BFS with the same scoring, in float32 like numpy.
 
@@ -41,10 +41,11 @@ function post(m) { self.postMessage(m); }
 
 /* ------------------------------------------------------------ loading */
 
-async function openCache(version) {
+// The graph files of the current build stay cached; anything else (an older build) is dropped.
+async function openCache(keep) {
   try {
     const cache = await caches.open("sixdeg-graph");
-    for (const req of await cache.keys()) if (!req.url.endsWith("v=" + version)) await cache.delete(req);
+    for (const req of await cache.keys()) if (!keep.has(req.url)) await cache.delete(req);
     return cache;
   } catch (e) {
     return null;  // no Cache API (private window, http://): just download every time
@@ -110,8 +111,8 @@ async function load({ base, version, graph }) {
       post({ type: "progress", loaded, total });
     }
   };
-  const cache = await openCache(version);
   const url = (name) => new URL(`${name}?v=${version}`, base).href;
+  const cache = await openCache(new Set(graph.files.map((f) => url(f.name))));
   const files = {};
   await Promise.all(graph.files.map(async (f) => { files[f.name] = await download(url(f.name), cache, onBytes); }));
   post({ type: "progress", loaded: total, total, decoding: true });
@@ -125,8 +126,8 @@ async function load({ base, version, graph }) {
 // loops live in plain functions: V8 optimises long loops inside async functions poorly.)
 function build(files, graph) {
   const L = graph.linked, C = graph.contexts, M = graph.memberships, D = graph.direct;
-  const { dbId, pScore } = decodePeople(files["graph-persons.bin"], L);
-  const { cpPtr, cScore, cCat, size } = decodeContexts(files["graph-contexts.bin"], C, graph.cat_start);
+  const { dbId, pScore } = decodePeople(files["graph-persons.gz"], L);
+  const { cpPtr, cScore, cCat, size } = decodeContexts(files["graph-contexts.gz"], C, graph.cat_start);
   const cpPer = new Int32Array(M);
   for (const part of graph.members) {
     varints(files[part.name], 0, part.count, cpPer, cpPtr[part.contexts[0]]);
@@ -134,7 +135,7 @@ function build(files, graph) {
     deltasToIds(cpPer, cpPtr, part.contexts[0], part.contexts[1]);
   }
   const [pcPtr, pcCtx, cost] = personContexts(cpPer, cpPtr, size, L, C, M);
-  const [dPtr, dNbr, dCat] = decodeDirect(files["graph-direct.bin"], L, D);
+  const [dPtr, dNbr, dCat] = decodeDirect(files["graph-direct.gz"], L, D);
   for (let p = 0; p < L; p++) cost[p] += dPtr[p + 1] - dPtr[p];
   return { L, C, dbId, pScore, cpPtr, cScore, cCat, cpPer, pcPtr, pcCtx, dPtr, dNbr, dCat, cost,
            sides: [newSide(L, C), newSide(L, C)] };

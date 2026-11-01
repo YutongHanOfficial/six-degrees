@@ -21,7 +21,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
-        if not self.path.split("?")[0].endswith(".bin"):
+        if "/data/" not in self.path:
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 

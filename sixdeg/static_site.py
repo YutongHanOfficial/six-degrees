@@ -3,9 +3,13 @@ Cloudflare Pages, Netlify...) can serve, with the search running in the visitor'
 
   site/index.html, app.js ...   the web app from sixdeg/web/, switched to its static engine
   site/data/meta.json           counts, code tables, and where everything is
-  site/data/graph-*.bin         the search graph (~30 MB): downloaded once, cached by the browser
-  site/data/<pack>-<n>.bin      everything else, as small gzip'd JSON shards packed into a few big
+  site/data/graph-*.gz          the search graph (~30 MB): downloaded once, cached by the browser
+  site/data/<pack>-<n>.gz       everything else, as small gzip'd JSON shards packed into a few big
   site/data/<pack>.json         files; the page reads single shards with HTTP range requests
+
+Every data file is a .gz (a pack is a series of gzip members, which is itself a valid .gz): hosts
+serve that type as is, whereas other binary files may get compressed on the fly -- GitHub Pages
+does that to .bin, and a byte range of the compressed copy is useless to the page.
 
 Packs, each sharded by its key:
   cards      person id -> [qid, name, description, birth, death, gender, sitelinks, image, enwiki,
@@ -129,7 +133,7 @@ class Pack:
         if self.f is None or self.f.tell() + len(blob) > PART_BYTES:
             if self.f:
                 self.f.close()
-            self.parts.append(f"{self.name}-{len(self.parts)}.bin")
+            self.parts.append(f"{self.name}-{len(self.parts)}.gz")
             self.part_start.append(len(self.lens))
             self.f = open(os.path.join(self.out_dir, self.parts[-1]), "wb")
         self.f.write(blob)
@@ -230,10 +234,10 @@ class Contexts:
 def export_graph(con, graph_dir: str, ctx: Contexts, out_dir: str) -> dict:
     """Varint streams the browser turns back into the CSR arrays graph.py uses.
 
-    graph-persons.bin   linked people as gaps between their ids, then their sitelinks
-    graph-contexts.bin  per web context: sitelinks, then size
-    graph-members-N.bin per web context: its members' graph ids, ascending, as deltas
-    graph-direct.bin    direct links (a < b, both graph ids), sorted: a gaps, b deltas, categories
+    graph-persons.gz    linked people as gaps between their ids, then their sitelinks
+    graph-contexts.gz   per web context: sitelinks, then size
+    graph-members-N.gz  per web context: its members' graph ids, ascending, as deltas
+    graph-direct.gz     direct links (a < b, both graph ids), sorted: a gaps, b deltas, categories
     """
     load = lambda n: np.load(os.path.join(graph_dir, n + ".npy"))
     d_ptr, d_nbr, d_cat = load("d_ptr"), load("d_nbr"), load("d_cat")
@@ -252,10 +256,10 @@ def export_graph(con, graph_dir: str, ctx: Contexts, out_dir: str) -> dict:
         files.append({"name": name, "bytes": len(blob)})
 
     sl = np.fromiter((r[0] for r in con.execute("SELECT sitelinks FROM person ORDER BY id")), np.int64, P)
-    put("graph-persons.bin", varint(np.diff(linked_ids, prepend=-1) - 1) + varint(sl[linked_ids]))
+    put("graph-persons.gz", varint(np.diff(linked_ids, prepend=-1) - 1) + varint(sl[linked_ids]))
 
     sizes = np.diff(cp_ptr)[ctx.order]
-    put("graph-contexts.bin", varint(ctx.sl[ctx.order]) + varint(sizes))
+    put("graph-contexts.gz", varint(ctx.sl[ctx.order]) + varint(sizes))
 
     # members of each context in web order, as graph ids (gid keeps id order, so rows stay sorted)
     starts = cp_ptr[:-1][ctx.order]
@@ -273,7 +277,7 @@ def export_graph(con, graph_dir: str, ctx: Contexts, out_dir: str) -> dict:
     for k in range(GRAPH_PARTS):
         a, b = bounds[k], bounds[k + 1]
         lo, hi = int(ends[a - 1]) if a else 0, int(ends[b - 1]) if b else 0
-        put(f"graph-members-{k}.bin", varint(delta[lo:hi]))
+        put(f"graph-members-{k}.gz", varint(delta[lo:hi]))
         member_parts.append({"name": files[-1]["name"], "contexts": [a, b], "count": hi - lo})
 
     src = np.repeat(np.arange(P), np.diff(d_ptr))
@@ -282,7 +286,7 @@ def export_graph(con, graph_dir: str, ctx: Contexts, out_dir: str) -> dict:
     o = np.lexsort((c, b, a))
     a, b, c = a[o], b[o], c[o]
     same_a = np.r_[False, a[1:] == a[:-1]]
-    put("graph-direct.bin", varint(np.diff(a, prepend=0)) +
+    put("graph-direct.gz", varint(np.diff(a, prepend=0)) +
         varint(np.where(same_a, b - np.r_[0, b[:-1]], b - a)) + c.astype(np.uint8).tobytes())
 
     log(f"  graph: {L:,} linked people, {ctx.C:,} contexts, {mem.size:,} memberships, "
