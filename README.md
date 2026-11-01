@@ -78,7 +78,7 @@ commit, so old data doesn't accumulate in the repository.
 (free for public repositories): `update`, `site`, the browser-vs-Python tests below, a check that
 the new data isn't more than 5% smaller than what is live (a sign that a download came back
 short), then `deploy`. If any step fails the live site stays as it was and GitHub emails you. A run
-takes 2–3 hours; start one by hand from the Actions tab ("Monthly data refresh" → "Run workflow"),
+takes about 40 minutes; start one by hand from the Actions tab ("Monthly data refresh" → "Run workflow"),
 and turn it off there too ("…" → "Disable workflow").
 
 How it works without a server:

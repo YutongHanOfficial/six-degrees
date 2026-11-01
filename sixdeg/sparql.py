@@ -41,6 +41,14 @@ class QueryTimeout(QueryError):
     pass
 
 
+class RateLimited(OSError):
+    """HTTP 429/503: the endpoint wants fewer requests for a while (retry_after: seconds it asked for)."""
+
+    def __init__(self, msg: str, retry_after: int = 0):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
 def _request(sparql: str, dest: str, timeout: int) -> int:
     body = urllib.parse.urlencode({"query": PREFIXES + sparql}).encode()
     req = urllib.request.Request(ENDPOINT, data=body, method="POST", headers={
@@ -70,6 +78,9 @@ def _request(sparql: str, dest: str, timeout: int) -> int:
             raise QueryTimeout(msg) from None
         if e.code == 400:
             raise QueryError(f"query rejected by endpoint: {msg}") from None
+        if e.code in (429, 503):
+            after = e.headers.get("Retry-After", "")
+            raise RateLimited(f"HTTP {e.code}: {msg[:200]}", int(after) if after.isdigit() else 0) from None
         raise OSError(f"HTTP {e.code}: {msg[:200]}") from None
     return _count_rows(dest)
 
@@ -91,7 +102,11 @@ def _count_rows(path: str) -> int:
 
 
 def run_query(sparql: str, dest: str, retries: int = 5, timeout: int = 600, log=print) -> int:
-    """Run one request (with retries on network errors). Returns the row count."""
+    """Run one request (with retries on network errors). Returns the row count.
+
+    "Too many requests" gets longer pauses (30 s doubling to 4 min, or what the endpoint asks for),
+    since the monthly refresh on GitHub's machines runs into the endpoint's rate limit.
+    """
     tmp = dest + ".part"
     last = ""
     for attempt in range(1, retries + 1):
@@ -105,10 +120,11 @@ def run_query(sparql: str, dest: str, retries: int = 5, timeout: int = 600, log=
             raise
         except QueryError:
             raise
+        except RateLimited as e:
+            last, wait = repr(e), min(300, max(e.retry_after, 30 * 2 ** (attempt - 1)))
         except (urllib.error.URLError, OSError, EOFError, ValueError) as e:
-            last = repr(e)
+            last, wait = repr(e), min(120, 5 * 2 ** (attempt - 1))
         if attempt < retries:
-            wait = min(120, 5 * 2 ** (attempt - 1))
             log(f"    retry {attempt}/{retries - 1} in {wait}s: {last[:160]}")
             time.sleep(wait)
     if os.path.exists(tmp):
