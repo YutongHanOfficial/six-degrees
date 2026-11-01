@@ -62,25 +62,29 @@ def cmd_site(args):
 
 
 def cmd_deploy(args):
-    """Publish the exported site as the gh-pages branch of a GitHub repository (one commit, force-pushed,
-    so old data doesn't pile up in the repository's history)."""
-    import shutil
+    """Publish the exported site as the gh-pages branch of a GitHub repository. Each deploy is one
+    parentless commit, force-pushed, so old data doesn't pile up in the repository; the local
+    repository in site/.git is kept, so files the last deploy already sent aren't uploaded again."""
     import subprocess
     site = os.path.abspath(args.dir)
     if not os.path.isfile(os.path.join(site, "data", "meta.json")):
         sys.exit("no site yet: run `python3 sixdeg.py site` first")
     remote = args.repo if "://" in args.repo or args.repo.startswith("git@") else f"https://github.com/{args.repo}.git"
     git = lambda *a: subprocess.run(["git", *a], cwd=site, check=True)
-    shutil.rmtree(os.path.join(site, ".git"), ignore_errors=True)
-    git("init", "-q", "-b", "gh-pages")
+    if not os.path.isdir(os.path.join(site, ".git")):
+        git("init", "-q", "-b", "gh-pages")
+    else:  # keep only what the last deploy pushed
+        git("reflog", "expire", "--expire=now", "--all")
+        git("gc", "-q", "--prune=now")
+    git("checkout", "-q", "--orphan", "next-deploy")
     git("add", "-A")
     ident = []
     if args.author:
         name, _, email = args.author.partition("<")
         ident = ["-c", f"user.name={name.strip()}", "-c", f"user.email={email.rstrip('>').strip()}"]
     git(*ident, "commit", "-q", "-m", args.message)
+    git("branch", "-M", "gh-pages")
     git("push", "-f", remote, "gh-pages")
-    shutil.rmtree(os.path.join(site, ".git"), ignore_errors=True)
     print(f"pushed {site} to the gh-pages branch of {remote}")
 
 

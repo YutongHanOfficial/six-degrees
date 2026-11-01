@@ -9,15 +9,17 @@
   const CFG = window.SIXDEG_STATIC;
   if (!CFG) return;
   const BASE = new URL(CFG.data, location.href);
-  const V = CFG.version;
+  let V = CFG.version;  // replaced by the version in meta.json, which is always fetched fresh
   const url = (name) => new URL(`${name}?v=${V}`, BASE).href;
   const PER_GROUP = 12;     // contexts listed per category in a person's panel
   const MAX_SHARDS = 40;    // a name query never reads more name-index shards than this
 
   let metaP = null;
-  const meta = () => (metaP ||= fetch(url("meta.json")).then((r) => {
+  const meta = () => (metaP ||= fetch(new URL("meta.json", BASE).href, { cache: "no-cache" }).then(async (r) => {
     if (!r.ok) throw new Error(`Could not load the database index (HTTP ${r.status})`);
-    return r.json();
+    const m = await r.json();
+    V = m.version;
+    return m;
   }));
 
   /* ---------------------------------------------------------- shards */
@@ -364,7 +366,7 @@
         }
       };
       worker.onerror = (e) => fail(e.message || "The search worker stopped.");
-      worker.postMessage({ type: "load", base: BASE.href, version: V, graph: m.graph });
+      worker.postMessage({ type: "load", base: BASE.href, version: m.version, graph: m.graph });
     })));
   }
 
