@@ -78,7 +78,7 @@ def cmd_deploy(args):
     if args.author:
         name, _, email = args.author.partition("<")
         ident = ["-c", f"user.name={name.strip()}", "-c", f"user.email={email.rstrip('>').strip()}"]
-    git(*ident, "commit", "-q", "-m", "Six Degrees static site")
+    git(*ident, "commit", "-q", "-m", args.message)
     git("push", "-f", remote, "gh-pages")
     shutil.rmtree(os.path.join(site, ".git"), ignore_errors=True)
     print(f"pushed {site} to the gh-pages branch of {remote}")
@@ -232,6 +232,7 @@ def main():
     p.add_argument("repo", help="OWNER/NAME of a GitHub repository, or a git remote URL")
     p.add_argument("--dir", default=os.path.join(HERE, "site"))
     p.add_argument("--author", help='commit author, "Name <email>" (default: your git config)')
+    p.add_argument("-m", "--message", default="Six Degrees static site", help="commit message")
     p.set_defaults(func=cmd_deploy)
     p = sub.add_parser("serve-site", help="preview the exported static website locally")
     p.add_argument("dir", nargs="?", default=os.path.join(HERE, "site"))
