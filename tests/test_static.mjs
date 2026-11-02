@@ -158,6 +158,9 @@ async function testEngine(app) {
     const r = await api.call("/api/connect", { from: ref.from, to: ref.to, k: 4 });
     check("connect degrees", r.degrees === ref.degrees, `${ref.from}->${ref.to}: ${r.degrees} vs ${ref.degrees}`);
     const mine = r.paths[0] ? r.paths[0].links.map((l) => l.sentence) : [];
+    const sources = r.paths[0] ? r.paths[0].links.map((l) => l.sources) : [];
+    check("link sources", JSON.stringify(sources) === JSON.stringify(ref.sources),
+          `${ref.from}->${ref.to}: ${JSON.stringify(sources)} vs ${JSON.stringify(ref.sources)}`);
     if (JSON.stringify(mine) !== JSON.stringify(ref.sentences)) {
       console.log(`  ${r.from.name} → ${r.to.name}:\n    static: ${mine.join(" | ")}\n    python: ${ref.sentences.join(" | ")}`);
     } else {

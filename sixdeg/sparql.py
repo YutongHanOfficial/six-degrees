@@ -49,9 +49,9 @@ class RateLimited(OSError):
         self.retry_after = retry_after
 
 
-def _request(sparql: str, dest: str, timeout: int) -> int:
+def _request(sparql: str, dest: str, timeout: int, endpoint: str = None) -> int:
     body = urllib.parse.urlencode({"query": PREFIXES + sparql}).encode()
-    req = urllib.request.Request(ENDPOINT, data=body, method="POST", headers={
+    req = urllib.request.Request(endpoint or ENDPOINT, data=body, method="POST", headers={
         "Accept": "text/csv",
         "Accept-Encoding": "gzip",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -101,7 +101,7 @@ def _count_rows(path: str) -> int:
     return n
 
 
-def run_query(sparql: str, dest: str, retries: int = 5, timeout: int = 600, log=print) -> int:
+def run_query(sparql: str, dest: str, retries: int = 5, timeout: int = 600, log=print, endpoint: str = None) -> int:
     """Run one request (with retries on network errors). Returns the row count.
 
     "Too many requests" gets longer pauses (30 s doubling to 4 min, or what the endpoint asks for),
@@ -111,7 +111,7 @@ def run_query(sparql: str, dest: str, retries: int = 5, timeout: int = 600, log=
     last = ""
     for attempt in range(1, retries + 1):
         try:
-            rows = _request(sparql, tmp, timeout)
+            rows = _request(sparql, tmp, timeout, endpoint)
             os.replace(tmp, dest)
             return rows
         except QueryTimeout:
@@ -132,7 +132,7 @@ def run_query(sparql: str, dest: str, retries: int = 5, timeout: int = 600, log=
     raise QueryError(f"giving up after {retries} attempts: {last[:400]}")
 
 
-def run_paged(sparql: str, dest: str, page: int, log=print, min_page: int = 50_000) -> int:
+def run_paged(sparql: str, dest: str, page: int, log=print, min_page: int = 50_000, endpoint: str = None) -> int:
     """Fetch `sparql` in LIMIT/OFFSET pages and concatenate them into `dest`.
 
     No ORDER BY: sorting would make the engine materialise the whole result for every page.
@@ -147,7 +147,7 @@ def run_paged(sparql: str, dest: str, page: int, log=print, min_page: int = 50_0
             q = f"{sparql}\nLIMIT {page} OFFSET {offset}"
             try:
                 t0 = time.time()
-                rows = run_query(q, tmp, log=log)
+                rows = run_query(q, tmp, log=log, endpoint=endpoint)
             except QueryTimeout as e:
                 if page // 2 < min_page:
                     raise QueryError(f"times out even with {page:,}-row pages: {e}") from None

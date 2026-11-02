@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from sixdeg import CATEGORIES, DEFAULT_OFF  # noqa: E402
 from sixdeg.graph import DIRECT_BONUS, Graph  # noqa: E402
 
+DATA = os.environ.get("SIXDEG_DATA", os.path.join(os.path.dirname(__file__), "..", "data"))
 KEYS = [k for k, _ in CATEGORIES]
 DEFAULT = sorted(set(KEYS) - DEFAULT_OFF)
 
@@ -43,20 +44,41 @@ PAIRS = [("Kevin Bacon", "Barack Obama"), ("Albert Einstein", "Marie Curie"), ("
          ("Lionel Messi", "Cristiano Ronaldo"), ("Ada Lovelace", "Alan Turing"), ("Napoleon", "Beyoncé"),
          ("Genghis Khan", "Bill Gates"), ("Frida Kahlo", "Leon Trotsky"), ("Serena Williams", "Winston Churchill"),
          ("Taylor Swift", "Isaac Newton"), ("Tom Hanks", "Kevin Bacon"), ("Paul McCartney", "John Lennon")]
-PANELS = ["Q7259", "Q76", "Q615", "Q2263", "Q9682", "Q303", "Q1035"]
+PANELS = ["Q7259", "Q76", "Q615", "Q2263", "Q9682", "Q303", "Q1035", "Q2599", "Q17457"]
+# people only in MusicBrainz or dblp (when the build has them): the best connected few
+EXTERNAL = 6
+# recordings, songs, albums and papers from MusicBrainz and dblp: two of each, linking their first two people
+EXTERNAL_CONTEXTS = ("mb:recording/", "mb:work/", "mb:release/", "dblp:")
 
 
 def app_refs(out_path):
     from sixdeg.server import App
-    app = App(os.path.join(os.path.dirname(__file__), "..", "data"))
+    app = App(DATA)
     out = {"search": [{"q": q, "ids": [p["id"] for p in app.store.search(q, 8)]} for q in QUERIES],
            "connect": [], "person": []}
     for a, b in PAIRS:
         qa, qb = app.store.resolve(a)["qid"], app.store.resolve(b)["qid"]
         r = app.connect(qa, qb, None, "", k=4)
         out["connect"].append({"from": qa, "to": qb, "degrees": r["degrees"],
-                               "sentences": [x["sentence"] for x in r["paths"][0]["links"]] if r["paths"] else []})
-    for qid in PANELS:
+                               "sentences": [x["sentence"] for x in r["paths"][0]["links"]] if r["paths"] else [],
+                               "sources": [x["sources"] for x in r["paths"][0]["links"]] if r["paths"] else []})
+    ext = [r[0] for r in app.store.db.execute(
+        "SELECT qid FROM person WHERE qid NOT LIKE 'Q%' ORDER BY n_relations + n_contexts DESC LIMIT ?", (EXTERNAL,))]
+    famous = [app.store.resolve(n)["qid"] for n in ("Paul McCartney", "Alan Turing", "David Bowie")]
+    pairs = list(zip(ext, famous + famous))
+    for prefix in EXTERNAL_CONTEXTS:
+        for (cid,) in app.store.db.execute("SELECT id FROM context WHERE qid LIKE ? ORDER BY id LIMIT 2",
+                                           (prefix + "%",)).fetchall():
+            pairs.append(tuple(r[0] for r in app.store.db.execute(
+                "SELECT p.qid FROM membership m JOIN person p ON p.id = m.person_id WHERE m.context_id = ?"
+                " ORDER BY p.id LIMIT 2", (cid,))))
+    for qa, qb in pairs:
+        r = app.connect(qa, qb, None, "", k=4)
+        out["connect"].append({"from": qa, "to": qb, "degrees": r["degrees"],
+                               "sentences": [x["sentence"] for x in r["paths"][0]["links"]] if r["paths"] else [],
+                               "sources": [x["sources"] for x in r["paths"][0]["links"]] if r["paths"] else []})
+    out["search"] += [{"q": q, "ids": [p["id"] for p in app.store.search(q, 8)]} for q in ext[:3]]
+    for qid in PANELS + ext[:2]:
         d = app.store.neighborhood(app.store.person_by_qid(qid)["id"])
         out["person"].append({"qid": qid, "summary": {
             "rel": {k: [len(v), [x["sentence"] for x in v[:25]]] for k, v in d["relations"].items()},
@@ -71,7 +93,7 @@ def main():
     if sys.argv[1] == "--app":
         return app_refs(sys.argv[2])
     out_path, n = sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 100
-    g = Graph(os.path.join(os.path.dirname(__file__), "..", "data", "graph"))
+    g = Graph(os.path.join(DATA, "graph"))
     linked = np.flatnonzero((np.diff(g.d_ptr) + np.diff(g.pc_ptr)) > 0)
     rng = random.Random(7)
     cases = []

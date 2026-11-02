@@ -1,4 +1,5 @@
-"""Refuses to publish a data refresh that lost a lot of data, a sign that a download went wrong.
+"""Refuses to publish a data refresh that lost a lot of data (a sign that a download went wrong),
+or that is too big for GitHub Pages.
 
   python3 tests/check_refresh.py live/meta.json site/data/meta.json [--allow-drop 0.05]
 
@@ -8,9 +9,11 @@ to month, so a real drop that large means a query came back short.
 """
 import argparse
 import json
+import os
 import sys
 
 KEYS = ("people", "relations", "contexts", "memberships")
+MAX_SITE = 1_000_000_000   # GitHub Pages publishes sites of up to 1 GB
 
 
 def main():
@@ -19,6 +22,13 @@ def main():
     ap.add_argument("new", help="meta.json of the new export")
     ap.add_argument("--allow-drop", type=float, default=0.05, help="largest allowed drop (default 0.05 = 5%%)")
     args = ap.parse_args()
+    site = os.path.dirname(os.path.dirname(os.path.abspath(args.new)))
+    size = sum(os.path.getsize(os.path.join(d, f)) for d, _, files in os.walk(site) if ".git" not in d
+               for f in files)
+    print(f"site size {size / 1e6:,.0f} MB")
+    if size > MAX_SITE:
+        print(f"not publishing: GitHub Pages takes sites of up to {MAX_SITE / 1e9:.0f} GB")
+        return 1
     try:
         with open(args.live) as f:
             live = json.load(f)["stats"]

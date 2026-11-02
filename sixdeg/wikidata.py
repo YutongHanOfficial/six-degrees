@@ -203,6 +203,15 @@ PEOPLE = [
   ?h skos:altLabel ?alias FILTER(LANG(?alias) = "en") }""", H=_H), 1_000_000),
 ]
 
+# ---------------------------------------------------------------- ids in other databases
+# How the other sources (musicbrainz.py, dblp.py) are matched to Wikidata, besides the Wikidata
+# links those sources keep themselves.
+
+EXTERNAL_IDS = [
+    Query("ext_musicbrainz", T("SELECT $X ?id WHERE { ?x wdt:P434 ?id }", X=sel("x"))),          # people and bands
+    Query("ext_dblp", T("SELECT $H ?id WHERE { ?h wdt:P2456 ?id . ?h wdt:P31 wd:Q5 }", H=_H)),
+]
+
 # ---------------------------------------------------------------- entity lookups (VALUES batches)
 
 
@@ -232,4 +241,4 @@ def bulk_queries():
     out = [Query(d.name, d.sparql) for d in DIRECT]
     out += [Query(m.name, m.sparql, m.page) for m in MEMBERS]
     out += [Query(n, q) for n, q in FLAGS.items()]
-    return out + PEOPLE
+    return out + PEOPLE + EXTERNAL_IDS

@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from . import CATEGORIES, CATEGORY_CODE, sparql, wikidata
+from . import CATEGORIES, CATEGORY_CODE, sources, sparql, wikidata
 from .fetch import raw_path
 
 NOPERIOD = -999999  # period column value for contexts that are not split by season/year
@@ -27,10 +27,11 @@ CAPS = {"work": 250, "authored": 25, "group": 60, "team": 80, "election": 15, "a
 RELATION_CATEGORY = {
     "spouse": "family", "partner": "family", "parent": "family", "sibling": "family",
     "relative": "family", "stepparent": "family", "godparent": "family",
-    "advisor": "science", "teacher": "science", "influence": "influence",
-    "partner_sport": "sports", "significant": "other", "succession": "politics",
+    "advisor": "science", "teacher": "science", "academic_advisor": "science", "influence": "influence",
+    "partner_sport": "sports", "coach": "sports", "significant": "other", "succession": "politics",
+    "served_during": "politics", "deputy": "politics", "associated": "music", "supporting": "music",
 }
-SYMMETRIC = {"spouse", "partner", "sibling", "partner_sport"}
+SYMMETRIC = {"spouse", "partner", "sibling", "partner_sport", "associated"}
 FAMILY_CATEGORY = {"team": "sports", "election": "politics", "award": "awards",
                    "event": "other", "document": "politics", "org": "business", "spaceflight": "other"}
 GENDER = {"Q6581097": "m", "Q6581072": "f", "Q2449503": "m", "Q1052281": "f"}
@@ -115,14 +116,16 @@ def stint_seasons(start: str, end: str):
 
 # ---------------------------------------------------------------- stage
 
-def stage(raw_dir: str, stage_path: str) -> sqlite3.Connection:
+def stage(raw_dir: str, stage_path: str, new_people: bool = True) -> sqlite3.Connection:
     if os.path.exists(stage_path):
         os.remove(stage_path)
     db = sqlite3.connect(stage_path, isolation_level=None)
     db.executescript("""
         PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-1000000; PRAGMA locking_mode=EXCLUSIVE;
-        CREATE TABLE s_rel(a INTEGER, b INTEGER, type TEXT, detail INTEGER, year INTEGER);
-        CREATE TABLE s_mem(fam TEXT, x INTEGER, period INTEGER, h INTEGER, role TEXT);
+        -- detail: a Wikidata item (office, kinship term); detail_text: the same as plain text (other sources)
+        CREATE TABLE s_rel(a INTEGER, b INTEGER, type TEXT, detail INTEGER, year INTEGER, detail_text TEXT,
+                           source TEXT);
+        CREATE TABLE s_mem(fam TEXT, x INTEGER, period INTEGER, h INTEGER, role TEXT, source TEXT);
         CREATE TABLE s_flag(x INTEGER, flag TEXT, PRIMARY KEY(x, flag)) WITHOUT ROWID;
         CREATE TABLE s_pname(h INTEGER PRIMARY KEY, name TEXT);   -- best label: en, else mul, else any
         CREATE TABLE s_pdesc(h INTEGER PRIMARY KEY, desc TEXT);
@@ -162,7 +165,7 @@ def stage(raw_dir: str, stage_path: str) -> sqlite3.Connection:
                 if d.swap:
                     a, b = b, a
                 yield a, b, d.type, qnum(det), as_int(yr)
-        load("INSERT INTO s_rel VALUES (?,?,?,?,?)", gen(), d.name)
+        load("INSERT INTO s_rel(a, b, type, detail, year, source) VALUES (?,?,?,?,?,'wikidata')", gen(), d.name)
 
     # person in context
     for m in wikidata.MEMBERS:
@@ -184,7 +187,7 @@ def stage(raw_dir: str, stage_path: str) -> sqlite3.Connection:
                     x, h = qnum(x), qnum(h)
                     if x and h:
                         yield m.family, x, NOPERIOD, h, m.role
-        load("INSERT INTO s_mem VALUES (?,?,?,?,?)", gen(), m.name)
+        load("INSERT INTO s_mem VALUES (?,?,?,?,?,'wikidata')", gen(), m.name)
 
     for name, flag in (("flag_music_groups", "music"), ("flag_family_groups", "family"),
                        ("flag_documentaries", "documentary")):
@@ -208,6 +211,8 @@ def stage(raw_dir: str, stage_path: str) -> sqlite3.Connection:
     load("INSERT OR IGNORE INTO s_pimg VALUES (?,?)", people("people_image", "image"), "people_image")
     load("INSERT OR IGNORE INTO s_pwiki VALUES (?,?)", people("people_enwiki", "title"), "people_enwiki")
     load("INSERT INTO s_alias VALUES (?,?)", people("people_alias", "alias"), "people_alias")
+    # the other sources, matched to the Wikidata people loaded above
+    sources.stage_sources(db, raw_dir, new_people)
     return db
 
 
@@ -226,7 +231,7 @@ def fetch_entities(db: sqlite3.Connection, raw_dir: str, batch: int = 50000) -> 
     cache.execute("CREATE TABLE IF NOT EXISTS anylabel(x INTEGER PRIMARY KEY, name TEXT)")
     db.executescript("""
         CREATE TABLE need(x INTEGER PRIMARY KEY);
-        INSERT OR IGNORE INTO need SELECT x FROM ctx;
+        INSERT OR IGNORE INTO need SELECT x FROM ctx WHERE x > 0;
         INSERT OR IGNORE INTO need SELECT detail FROM rel_kept WHERE detail IS NOT NULL;
     """)
 
@@ -290,7 +295,8 @@ def fetch_entities(db: sqlite3.Connection, raw_dir: str, batch: int = 50000) -> 
 SCHEMA = """
 CREATE TABLE person(
   id INTEGER PRIMARY KEY,          -- dense id, ordered by prominence (0 = most Wikipedia editions)
-  qid TEXT NOT NULL,               -- Wikidata id, e.g. 'Q76'
+  qid TEXT NOT NULL,               -- Wikidata id, e.g. 'Q76'; for people only in another source,
+                                   -- 'mb:<MusicBrainz artist id>' or 'dblp:<dblp person id>'
   name TEXT NOT NULL,
   description TEXT,
   birth_year INTEGER,
@@ -304,7 +310,8 @@ CREATE TABLE person(
 );
 CREATE TABLE context(
   id INTEGER PRIMARY KEY,
-  qid TEXT NOT NULL,
+  qid TEXT NOT NULL,               -- Wikidata id, or 'mb:recording/<id>', 'mb:<group id>', 'dblp:<paper key>',
+                                   -- 'wp:<Wikipedia article>' for things only in another source
   kind TEXT NOT NULL,              -- work, authored, group, team, election, award, event, document, org, spaceflight
   category TEXT NOT NULL,          -- see sixdeg.CATEGORIES
   name TEXT NOT NULL,
@@ -317,6 +324,8 @@ CREATE TABLE membership(
   person_id INTEGER NOT NULL,
   context_id INTEGER NOT NULL,
   role TEXT,                       -- e.g. 'cast member', 'director,screenwriter', 'player'
+  source TEXT NOT NULL,            -- where this membership comes from: wikidata, wikipedia, musicbrainz, dblp
+                                   -- (comma-separated when several agree)
   PRIMARY KEY(person_id, context_id)
 ) WITHOUT ROWID;
 CREATE TABLE relation(
@@ -326,8 +335,10 @@ CREATE TABLE relation(
                                    -- advisor, teacher, influence, partner_sport, significant, succession
   category TEXT NOT NULL,
   detail TEXT,                     -- office held, kinship term or role, when known
-  year INTEGER
+  year INTEGER,
+  source TEXT NOT NULL             -- as membership.source
 );
+CREATE TABLE alias(person_id INTEGER NOT NULL, alias TEXT NOT NULL);   -- other names, for name search
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -337,6 +348,7 @@ CREATE INDEX context_qid ON context(qid);
 CREATE INDEX membership_context ON membership(context_id, person_id);
 CREATE INDEX relation_a ON relation(a_id, b_id);
 CREATE INDEX relation_b ON relation(b_id, a_id);
+CREATE INDEX alias_person ON alias(person_id);
 """
 
 
@@ -347,6 +359,61 @@ def _case(column: str, mapping: dict) -> str:
 
 def _in(values) -> str:
     return "(" + ",".join("'%s'" % v for v in sorted(values)) + ")"
+
+
+def _mix(x: np.ndarray, seed: int) -> np.ndarray:
+    """splitmix64 of each value: sums of these identify a set of ids, whatever the order."""
+    x = x.astype(np.uint64) + np.uint64(seed)
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return x ^ (x >> np.uint64(31))
+
+
+def drop_repeats(db: sqlite3.Connection) -> None:
+    """Keep one of the outside-source works and papers that link exactly the same people.
+
+    MusicBrainz lists every recording, song and album on its own, and dblp every paper, so the same
+    few people often share hundreds of them, and Wikidata often has the same paper or song too. The
+    copies add nothing to any route (those people are one step apart either way) but take space on
+    the site, so one stays per set of people and link type: Wikidata's own item, else a song before
+    a recording before an album, then the earliest.
+    """
+    t0 = time.time()
+    cat_code = "CASE %%s %s ELSE 99 END" % " ".join("WHEN '%s' THEN %d" % kv for kv in CATEGORY_CODE.items())
+    # the link type each work will get (as "write contexts" decides it)
+    category = """COALESCE(ec.category, CASE WHEN c.fam = 'authored' THEN CASE WHEN e.scholarly THEN 'science' ELSE 'arts' END
+                                           WHEN c.film THEN 'film' WHEN c.music THEN 'music' ELSE 'arts' END)"""
+    info = _fetch_array(db, f"""
+        SELECT c.id, {cat_code % category},
+               CASE WHEN c.x > 0 THEN -1 WHEN ec.key LIKE 'mb:work/%' THEN 0 WHEN ec.key LIKE 'mb:recording/%' THEN 1
+                    ELSE 2 END,
+               COALESCE(cy.year, 1 << 30)
+        FROM ctx c JOIN ctx_year cy ON cy.id = c.id LEFT JOIN s_extc ec ON ec.x = c.x LEFT JOIN s_ent e ON e.x = c.x
+        WHERE c.fam IN ('work', 'authored')""", 4)
+    mem = _fetch_array(db, """
+        SELECT m.cid, m.h FROM mem_ok m JOIN ctx_year cy ON cy.id = m.cid WHERE cy.fam IN ('work', 'authored')""", 2)
+    if not mem.size:
+        return
+    mem = mem[np.lexsort((mem[:, 1], mem[:, 0]))]
+    mem = mem[np.r_[True, (mem[1:] != mem[:-1]).any(axis=1)]]      # one row per person (several roles)
+    cid, h = mem[:, 0], mem[:, 1]
+    starts = np.flatnonzero(np.r_[True, cid[1:] != cid[:-1]])
+    ids, n = cid[starts], np.diff(np.r_[starts, cid.size])
+    with np.errstate(over="ignore"):
+        s1 = np.add.reduceat(_mix(h, 0x9E3779B97F4A7C15), starts)
+        s2 = np.add.reduceat(_mix(h, 0xD1B54A32D192ED03), starts)
+    info = info[np.argsort(info[:, 0])]
+    cat, rank, year = info[np.searchsorted(info[:, 0], ids), 1:].T
+    o = np.lexsort((ids, year, rank, n, cat, s2, s1))
+    s1, s2, cat, n, ids, rank = s1[o], s2[o], cat[o], n[o], ids[o], rank[o]
+    same = (s1[1:] == s1[:-1]) & (s2[1:] == s2[:-1]) & (cat[1:] == cat[:-1]) & (n[1:] == n[:-1])
+    drop = ids[1:][same & (rank[1:] >= 0)]                          # Wikidata's own items all stay
+    db.execute("CREATE TABLE ctx_repeat(cid INTEGER PRIMARY KEY)")
+    db.execute("BEGIN")
+    db.executemany("INSERT INTO ctx_repeat VALUES (?)", ((int(c),) for c in drop))
+    db.execute("COMMIT")
+    db.execute("DELETE FROM ctx_n WHERE cid IN (SELECT cid FROM ctx_repeat)")
+    log(f"  repeated works and papers: dropped {drop.size:,} of {(rank >= 0).sum():,} ({time.time() - t0:.0f}s)")
 
 
 def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_sitelinks: int) -> None:
@@ -373,18 +440,31 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
     """)
     step("memberships", """
         CREATE TABLE mem_kept AS
-          SELECT c.id AS cid, m.h AS h, m.role AS role
+          SELECT c.id AS cid, m.h AS h, m.role AS role, m.source AS source
           FROM s_mem m JOIN ctx c ON c.fam = m.fam AND c.x = m.x AND c.period = m.period;
     """)
-    sym = _in(SYMMETRIC)
+    # symmetric types, and a "relative" with no kinship term (Wikipedia states it from both pages)
+    sym = f"(type IN {_in(SYMMETRIC)} OR (type = 'relative' AND detail IS NULL AND detail_text IS NULL))"
     step("relations", f"""
         CREATE TABLE rel_kept AS
-          SELECT CAST(a AS INTEGER) AS a, CAST(b AS INTEGER) AS b, type, detail, MAX(year) AS year FROM (
-            SELECT CASE WHEN type IN {sym} AND b < a THEN b ELSE a END AS a,
-                   CASE WHEN type IN {sym} AND b < a THEN a ELSE b END AS b,
-                   type, detail, year
+          SELECT CAST(a AS INTEGER) AS a, CAST(b AS INTEGER) AS b, type, detail, detail_text, MAX(year) AS year,
+                 GROUP_CONCAT(DISTINCT source) AS source, SUM(source = 'wikipedia') AS n_wp FROM (
+            SELECT CASE WHEN {sym} AND b < a THEN b ELSE a END AS a,
+                   CASE WHEN {sym} AND b < a THEN a ELSE b END AS b,
+                   type, detail, detail_text, year, source
             FROM s_rel WHERE a != b)
-          GROUP BY a, b, type, detail;
+          GROUP BY a, b, type, detail, detail_text;
+        CREATE INDEX rel_kept_ab ON rel_kept(a, b);
+        -- a marriage that only one statement outside Wikidata gives is not used as one: Wikipedia
+        -- infoboxes also link a spouse's parents and former spouses, and MusicBrainz sometimes says
+        -- "married" of long-term couples. A Wikipedia marriage counts when both people's pages give
+        -- it (or another source agrees); one that only MusicBrainz records counts as a partnership.
+        DELETE FROM rel_kept WHERE type = 'spouse' AND source = 'wikipedia' AND n_wp < 2;
+        INSERT INTO rel_kept(a, b, type, detail, detail_text, year, source, n_wp)
+          SELECT a, b, 'partner', NULL, NULL, NULL, source, 0 FROM rel_kept r
+          WHERE type = 'spouse' AND source = 'musicbrainz'
+            AND NOT EXISTS (SELECT 1 FROM rel_kept p WHERE p.a = r.a AND p.b = r.b AND p.type = 'partner');
+        DELETE FROM rel_kept WHERE type = 'spouse' AND source = 'musicbrainz';
         -- drop relations that cannot be true: parents 12-75 years older than the child and alive
         -- (give or take a year) at the birth; spouses, teachers, advisors and partners alive at once
         DELETE FROM rel_kept WHERE rowid IN (
@@ -397,8 +477,14 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
           SELECT r.rowid FROM rel_kept r
           LEFT JOIN s_pbirth ba ON ba.h = r.a LEFT JOIN s_pdeath da ON da.h = r.a
           LEFT JOIN s_pbirth bb ON bb.h = r.b LEFT JOIN s_pdeath db ON db.h = r.b
-          WHERE r.type IN ('spouse', 'partner', 'advisor', 'teacher', 'partner_sport')
+          WHERE r.type IN ('spouse', 'partner', 'advisor', 'teacher', 'partner_sport', 'academic_advisor', 'coach',
+                           'served_during', 'deputy', 'supporting')
             AND (da.year < bb.year OR db.year < ba.year));
+        -- a bare "relative" says nothing more when the two are known to be related more precisely
+        DELETE FROM rel_kept WHERE type = 'relative' AND detail IS NULL AND detail_text IS NULL AND EXISTS (
+          SELECT 1 FROM rel_kept q WHERE ((q.a = rel_kept.a AND q.b = rel_kept.b) OR (q.a = rel_kept.b AND q.b = rel_kept.a))
+            AND (q.type IN ('spouse', 'partner', 'parent', 'sibling', 'stepparent', 'godparent')
+                 OR (q.type = 'relative' AND (q.detail IS NOT NULL OR q.detail_text IS NOT NULL))));
     """)
     log("  looking up context names")
     fetch_entities(db, raw_dir)
@@ -407,8 +493,8 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
         -- when each context happened: the season / award year, else the item's earliest date
         CREATE TABLE ctx_year AS
           SELECT c.id AS id, c.fam AS fam, c.x AS x,
-                 CAST(CASE WHEN c.period != {NOPERIOD} THEN c.period ELSE e.year END AS INTEGER) AS year
-          FROM ctx c LEFT JOIN s_ent e ON e.x = c.x;
+                 CAST(CASE WHEN c.period != {NOPERIOD} THEN c.period ELSE COALESCE(e.year, ec.year) END AS INTEGER) AS year
+          FROM ctx c LEFT JOIN s_ent e ON e.x = c.x LEFT JOIN s_extc ec ON ec.x = c.x;
         CREATE UNIQUE INDEX ctx_year_id ON ctx_year(id);
         -- keep a membership only if it could be a real meeting:
         --   * events must be dated (else "commencement at Harvard" links speakers decades apart)
@@ -416,7 +502,7 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
         --     (drops archive footage of the dead, posthumous credits, editions of old texts)
         --   * on-screen "cast" of documentaries are interviewees and archive clips, not co-workers
         CREATE TABLE mem_ok AS
-          SELECT mk.cid AS cid, mk.h AS h, mk.role AS role
+          SELECT mk.cid AS cid, mk.h AS h, mk.role AS role, mk.source AS source
           FROM mem_kept mk
           JOIN ctx_year cy ON cy.id = mk.cid
           LEFT JOIN s_pdeath d ON d.h = mk.h
@@ -436,6 +522,9 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
           WHERE cy.fam != 'group' AND d.year < x.maxb);
         CREATE TABLE ctx_n AS SELECT cid, COUNT(DISTINCT h) AS n FROM mem_ok GROUP BY cid;
         CREATE UNIQUE INDEX ctx_n_cid ON ctx_n(cid);
+    """)
+    drop_repeats(db)
+    step("final contexts", """
         -- renumber the surviving contexts densely (the graph arrays index them 0..C-1)
         CREATE TABLE ctx_final AS
           SELECT CAST(ROW_NUMBER() OVER (ORDER BY c.id) - 1 AS INTEGER) AS id, c.id AS old_id,
@@ -443,7 +532,7 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
           FROM ctx c JOIN ctx_n n ON n.cid = c.id WHERE n.n >= 2;
         CREATE UNIQUE INDEX ctx_final_old ON ctx_final(old_id);
         CREATE TABLE mem_final AS
-          SELECT f.id AS cid, m.h AS h, m.role AS role FROM mem_ok m JOIN ctx_final f ON f.old_id = m.cid;
+          SELECT f.id AS cid, m.h AS h, m.role AS role, m.source AS source FROM mem_ok m JOIN ctx_final f ON f.old_id = m.cid;
     """)
     kept = db.execute("SELECT (SELECT COUNT(*) FROM mem_final), (SELECT COUNT(*) FROM mem_kept), "
                       "(SELECT COUNT(*) FROM ctx_final), (SELECT COUNT(*) FROM ctx)").fetchone()
@@ -477,7 +566,7 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
     fam_cat = _case("c.fam", FAMILY_CATEGORY)
     step("write people", """
         INSERT INTO out.person(id, qid, name, description, birth_year, death_year, gender, sitelinks, image, enwiki)
-          SELECT pm.id, 'Q' || pm.h, COALESCE(n.name, 'Q' || pm.h), d.desc,
+          SELECT pm.id, COALESCE(x.key, 'Q' || pm.h), COALESCE(n.name, x.key, 'Q' || pm.h), d.desc,
                  b.year, dd.year, g.gender, COALESCE(sl.sl, 0), img.image, w.title
           FROM pmap pm
           LEFT JOIN s_pname n ON n.h = pm.h
@@ -488,36 +577,40 @@ def assemble(db: sqlite3.Connection, out_path: str, raw_dir: str, min_isolated_s
           LEFT JOIN s_psl sl ON sl.h = pm.h
           LEFT JOIN s_pimg img ON img.h = pm.h
           LEFT JOIN s_pwiki w ON w.h = pm.h
+          LEFT JOIN s_ext x ON x.h = pm.h
           ORDER BY pm.id;
     """)
     step("write contexts", f"""
         INSERT INTO out.context(id, qid, kind, category, name, year, period, sitelinks, size)
-          SELECT c.id, 'Q' || c.x, c.fam,
-                 CASE c.fam WHEN 'work' THEN {work_cat} WHEN 'group' THEN {group_cat}
+          SELECT c.id, COALESCE(ec.key, 'Q' || c.x), c.fam,
+                 COALESCE(ec.category, CASE c.fam WHEN 'work' THEN {work_cat} WHEN 'group' THEN {group_cat}
                             WHEN 'authored' THEN CASE WHEN e.scholarly THEN 'science' ELSE 'arts' END
-                            ELSE {fam_cat} END,
-                 COALESCE(e.name, 'Q' || c.x),
-                 CASE WHEN c.period != {NOPERIOD} THEN c.period ELSE e.year END,
+                            ELSE {fam_cat} END),
+                 COALESCE(e.name, ec.name, 'Q' || c.x),
+                 CASE WHEN c.period != {NOPERIOD} THEN c.period ELSE COALESCE(e.year, ec.year) END,
                  NULLIF(c.period, {NOPERIOD}), COALESCE(e.sl, 0), c.n
-          FROM ctx_final c LEFT JOIN s_ent e ON e.x = c.x
+          FROM ctx_final c LEFT JOIN s_ent e ON e.x = c.x LEFT JOIN s_extc ec ON ec.x = c.x
           ORDER BY c.id;
     """)
     step("write memberships", """
-        INSERT INTO out.membership(person_id, context_id, role)
-          SELECT pm.id, mk.cid, GROUP_CONCAT(DISTINCT mk.role)
+        INSERT INTO out.membership(person_id, context_id, role, source)
+          SELECT pm.id, mk.cid, GROUP_CONCAT(DISTINCT mk.role), GROUP_CONCAT(DISTINCT mk.source)
           FROM mem_final mk JOIN pmap pm ON pm.h = mk.h
           GROUP BY pm.id, mk.cid ORDER BY pm.id, mk.cid;
     """)
     step("write relations", f"""
-        INSERT INTO out.relation(a_id, b_id, type, category, detail, year)
-          SELECT pa.id, pb.id, r.type, {_case("r.type", RELATION_CATEGORY)}, e.name, r.year
+        INSERT INTO out.relation(a_id, b_id, type, category, detail, year, source)
+          SELECT pa.id, pb.id, r.type, {_case("r.type", RELATION_CATEGORY)}, COALESCE(e.name, r.detail_text), r.year,
+                 r.source
           FROM rel_kept r JOIN pmap pa ON pa.h = r.a JOIN pmap pb ON pb.h = r.b
           LEFT JOIN s_ent e ON e.x = r.detail;
+        INSERT INTO out.alias(person_id, alias)
+          SELECT DISTINCT pm.id, a.alias FROM s_alias a JOIN pmap pm ON pm.h = a.h;
     """)
     db.execute("DETACH DATABASE out")
 
 
-def finish_db(out_path: str, db: sqlite3.Connection) -> None:
+def finish_db(out_path: str) -> None:
     out = sqlite3.connect(out_path, isolation_level=None)
     out.executescript("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-1000000;")
     t0 = time.time()
@@ -539,19 +632,15 @@ def finish_db(out_path: str, db: sqlite3.Connection) -> None:
     t0 = time.time()
     out.execute("""CREATE VIRTUAL TABLE person_search USING fts5(
         name, aliases, content='', columnsize=0, tokenize='unicode61 remove_diacritics 2', prefix='2 3')""")
-    db.execute("CREATE INDEX IF NOT EXISTS s_alias_h ON s_alias(h)")
-    aliases = {}
-    for h, al in db.execute("SELECT a.h, group_concat(a.alias, ' ; ') FROM s_alias a "
-                            "JOIN pmap pm ON pm.h = a.h GROUP BY a.h"):
-        aliases["Q%d" % h] = al
+    aliases = dict(out.execute("SELECT person_id, group_concat(alias, ' ; ') FROM alias GROUP BY person_id"))
     out.execute("BEGIN")
-    cur = out.execute("SELECT id, qid, name FROM person")
+    cur = out.execute("SELECT id, name FROM person")
     while True:
         chunk = cur.fetchmany(200000)
         if not chunk:
             break
         out.executemany("INSERT INTO person_search(rowid, name, aliases) VALUES (?,?,?)",
-                        [(i, nm, aliases.get(q, "")) for i, q, nm in chunk])
+                        [(i, nm, aliases.get(i, "")) for i, nm in chunk])
     out.execute("COMMIT")
     out.execute("INSERT INTO person_search(person_search) VALUES ('optimize')")
     log(f"  name search index ({time.time() - t0:.0f}s)")
@@ -560,7 +649,8 @@ def finish_db(out_path: str, db: sqlite3.Connection) -> None:
               for k in ("person", "context", "membership", "relation")}
     meta = {
         "built_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
-        "source": "Wikidata (CC0) via the QLever SPARQL endpoint " + sparql.ENDPOINT,
+        "source": "Wikidata (CC0) via the QLever SPARQL endpoint " + sparql.ENDPOINT
+                  + "; Wikipedia infoboxes via DBpedia (CC BY-SA); MusicBrainz (CC0); dblp (CC0)",
         **{"count_" + k: str(v) for k, v in counts.items()},
     }
     out.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", meta.items())
@@ -644,7 +734,7 @@ def reopen_stage(stage_path: str) -> sqlite3.Connection:
 
 
 def build(data_dir: str, min_isolated_sitelinks: int = 1, keep_stage: bool = False,
-          reuse_stage: bool = False) -> None:
+          reuse_stage: bool = False, new_people: bool = True) -> None:
     raw_dir = os.path.join(data_dir, "raw")
     stage_path = os.path.join(data_dir, "stage.db")
     db_path = os.path.join(data_dir, "people.db")
@@ -655,11 +745,11 @@ def build(data_dir: str, min_isolated_sitelinks: int = 1, keep_stage: bool = Fal
         db = reopen_stage(stage_path)
     else:
         log("staging raw files")
-        db = stage(raw_dir, stage_path)
+        db = stage(raw_dir, stage_path, new_people)
     log("assembling database")
     assemble(db, tmp_db, raw_dir, min_isolated_sitelinks)
     log("indexing")
-    finish_db(tmp_db, db)
+    finish_db(tmp_db)
     db.close()
     if not keep_stage:
         os.remove(stage_path)

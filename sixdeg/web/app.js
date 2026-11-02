@@ -283,7 +283,7 @@ function renderResult() {
       <li class="node">
         ${avatar(p, "lg")}
         <div class="who">
-          <a class="name" href="${esc(p.wikipedia || p.wikidata)}" target="_blank" rel="noopener">${esc(p.name)}</a>
+          <a class="name" href="${esc(p.wikipedia || p.wikidata || p.link)}" target="_blank" rel="noopener">${esc(p.name)}</a>
           <div class="meta">${esc(metaLine(p))}</div>
         </div>
         <div class="btns">
@@ -296,11 +296,14 @@ function renderResult() {
       const also = link.also && link.also.count
         ? `<p class="also">Also in common: ${esc(link.also.items.join(" · "))}${link.also.count > link.also.items.length ? ` · +${link.also.count - link.also.items.length} more` : ""}</p>`
         : "";
+      // where this link comes from, linked to the record when there is one page for it
+      const from = link.sources && link.sources.length ? `Source: ${esc(link.sources.join(" · "))}` : "";
+      const src = from && `<p class="src">${link.url ? `<a href="${esc(link.url)}" target="_blank" rel="noopener">${from} ↗</a>` : from}</p>`;
       html += `
         <li class="edge cat-${link.category}">
           <span class="pill">${esc(link.category_label)}</span>
           <p class="sentence">${boldNames(link.sentence, [p.name, path.people[i + 1].name])}</p>
-          ${also}
+          ${also}${src}
         </li>`;
     }
   });
@@ -376,7 +379,7 @@ async function explore(qid) {
       <div class="head">${avatar(p, "xl")}<div><h2>${esc(p.name)}</h2><div class="meta">${esc(metaLine(p))}</div></div></div>
       <div class="links">
         ${p.wikipedia ? `<a href="${esc(p.wikipedia)}" target="_blank" rel="noopener">Wikipedia ↗</a>` : ""}
-        <a href="${esc(p.wikidata)}" target="_blank" rel="noopener">Wikidata ↗</a>
+        <a href="${esc(p.wikidata || p.link)}" target="_blank" rel="noopener">${esc(p.wikidata ? "Wikidata" : p.source)} ↗</a>
         <button type="button" class="mini-btn" data-set-from="${esc(p.qid)}">Use as “From”</button>
         <button type="button" class="mini-btn" data-set-to="${esc(p.qid)}">Use as “To”</button>
       </div>`;
@@ -397,7 +400,7 @@ async function explore(qid) {
       if (nRels > 25) s += `<li class="more">… and ${nRels - 25} more</li>`;
       for (const c of (ctx ? ctx.items : [])) {
         s += `<li><div class="ctx-title">${esc(c.title)}</div>
-          <div class="ctx-role">${esc(c.role || "member")} · ${c.seasons > 1 ? `${c.seasons} seasons` : `${c.size} people`}</div>
+          <div class="ctx-role">${esc(roleText(c.role))} · ${c.seasons > 1 ? `${c.seasons} seasons` : `${c.size} people`}</div>
           ${c.with.length ? `<div class="with">with ${c.with.map((m) => `<button type="button" class="linkish" data-explore="${esc(m.qid)}">${esc(m.name)}</button>`).join("")}</div>` : ""}
         </li>`;
       }
@@ -412,6 +415,11 @@ async function explore(qid) {
     body.innerHTML = `<button class="close" type="button" aria-label="Close">×</button><div class="notice err">${esc(e.message)}</div>`;
   }
 }
+
+// MusicBrainz credit names, as people would say them
+const ROLE_TEXT = { vocal: "vocals", instrument: "musician", recording: "recording engineer", mix: "mixing engineer",
+                    programming: "programmer", writer: "songwriter" };
+const roleText = (roles) => (roles || "member").split(", ").map((r) => ROLE_TEXT[r] || r).join(", ");
 
 function closeDrawer() { $("#drawer").hidden = true; $("#scrim").hidden = true; }
 $("#scrim").addEventListener("click", closeDrawer);

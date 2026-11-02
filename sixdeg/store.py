@@ -10,11 +10,33 @@ from . import CATEGORIES
 
 CATEGORY_LABEL = dict(CATEGORIES)
 RELATION_PRIORITY = ["spouse", "parent", "sibling", "partner", "relative", "stepparent", "godparent",
-                     "advisor", "teacher", "partner_sport", "succession", "significant", "influence"]
+                     "advisor", "teacher", "academic_advisor", "coach", "supporting", "partner_sport",
+                     "deputy", "served_during", "succession", "associated", "significant", "influence"]
+SOURCE_LABEL = {"wikidata": "Wikidata", "wikipedia": "Wikipedia", "musicbrainz": "MusicBrainz", "dblp": "dblp"}
 _TOKEN = re.compile(r"\w+", re.UNICODE)
 # "(1935–1977)", "(born 2002)", "(b. 1990)" at the end of a description: redundant next to the years
 _YEARS_SUFFIX = re.compile(r"\s*\((?:born |b\. )?-?\d{1,4}(?:\s*[–-]\s*-?\d{1,4})?\)\s*$")
 _QID = re.compile(r"^[Qq](\d+)$")
+_KEY = re.compile(r"^(mb|dblp):\S+$")   # people who are only in MusicBrainz or dblp
+
+
+def source_url(key: str):
+    """The page of a person ('Q76', 'mb:<id>', 'dblp:<pid>') or context ('mb:recording/<id>',
+    'dblp:<paper key>', 'wp:<article>') in the database it comes from."""
+    if key.startswith("Q"):
+        return "https://www.wikidata.org/wiki/" + key
+    src, _, rest = key.partition(":")
+    if src == "mb":
+        return "https://musicbrainz.org/" + (rest if "/" in rest else "artist/" + rest)
+    if src == "dblp":
+        return ("https://dblp.org/rec/" + rest + ".html") if rest.split("/")[0] in DBLP_VENUES else \
+            "https://dblp.org/pid/" + rest + ".html"
+    if src == "wp":
+        return "https://en.wikipedia.org/wiki/" + urllib.parse.quote(rest.replace(" ", "_"))
+    return None
+
+
+DBLP_VENUES = {"journals", "conf", "books", "series", "reference", "phd", "persons", "tr", "ms", "www", "dblpnote"}
 
 
 def image_url(file_name, width=160):
@@ -32,7 +54,8 @@ _NEEDS_ARTICLE = re.compile(
     r"declaration|charter|constitution|manifesto|petition|resolution|convention|congress|council|summit|"
     r"assembly|parliament|senate|committee|commission|society|academy|club|party|group|family|dynasty|house|"
     r"games|olympics|cup|championships?|tournament|final|race|marathon|grand prix|open|trophy|league|"
-    r"award|prize|medal|order|cross|honou?rs|expedition|festival|referendum|debate|primary|caucus)\b", re.I)
+    r"award|prize|medal|order|cross|honou?rs|expedition|festival|referendum|debate|primary|caucus|"
+    r"orchestra|choir|ensemble|quartet|philharmonic)\b", re.I)
 
 
 def _the(name: str) -> str:
@@ -89,7 +112,11 @@ class Store:
         p["image_url"] = image_url(p.get("image"))
         p["wikipedia"] = ("https://en.wikipedia.org/wiki/" + urllib.parse.quote(p["enwiki"].replace(" ", "_"))
                           if p.get("enwiki") else None)
-        p["wikidata"] = "https://www.wikidata.org/wiki/" + p["qid"]
+        p["wikidata"] = source_url(p["qid"]) if p["qid"].startswith("Q") else None
+        # people who are only in MusicBrainz or dblp: their page there
+        p["source"], p["link"] = (("Wikidata", None) if p["qid"].startswith("Q") else
+                                  (SOURCE_LABEL["musicbrainz" if p["qid"].startswith("mb:") else "dblp"],
+                                   source_url(p["qid"])))
         return p
 
     def people(self, ids) -> dict:
@@ -103,16 +130,18 @@ class Store:
         return out
 
     def person_by_qid(self, qid: str):
-        row = self.db.execute("SELECT * FROM person WHERE qid = ?", (qid.upper(),)).fetchone()
+        """By Wikidata id ('Q76') or, for people only in another source, its key ('mb:<id>')."""
+        qid = qid.strip()
+        key = qid.upper() if _QID.match(qid) else qid
+        row = self.db.execute("SELECT * FROM person WHERE qid = ?", (key,)).fetchone()
         return self.card(row) if row else None
 
     def search(self, text: str, limit: int = 8) -> list:
         text = (text or "").strip()
         if not text:
             return []
-        m = _QID.match(text)
-        if m:
-            p = self.person_by_qid("Q" + m.group(1))
+        if _QID.match(text) or _KEY.match(text):
+            p = self.person_by_qid(text)
             return [p] if p else []
         tokens = _TOKEN.findall(text.lower())
         if not tokens:
@@ -147,13 +176,20 @@ class Store:
         shared = self.shared(a, b, cats)
         if via >= 0:
             ctx = dict(self.db.execute("SELECT * FROM context WHERE id = ?", (via,)).fetchone())
-            roles = {r["person_id"]: set((r["role"] or "").split(",")) for r in self.db.execute(
-                "SELECT person_id, role FROM membership WHERE context_id = ? AND person_id IN (?, ?)", (via, a, b))}
+            mem = {r["person_id"]: r for r in self.db.execute(
+                "SELECT person_id, role, source FROM membership WHERE context_id = ? AND person_id IN (?, ?)",
+                (via, a, b))}
+            roles = {p: set((r["role"] or "").split(",")) for p, r in mem.items()}
             main = next((g for g in shared if via in g["ids"]), None)
             title = main["title"] if main else context_title(ctx)
             out = {"kind": "context", "category": ctx["category"],
                    "sentence": context_sentence(ctx, A, B, roles.get(a, set()), roles.get(b, set()), title),
-                   "context": {k: ctx[k] for k in ("qid", "name", "year", "kind", "period", "size")}}
+                   "context": {k: ctx[k] for k in ("qid", "name", "year", "kind", "period", "size")},
+                   "sources": _sources(*(r["source"] for r in mem.values()))}
+            # the record to check it against: the context's own page, unless that is a Wikidata item
+            # and Wikidata isn't among the sources
+            out["url"] = (None if ctx["qid"].startswith("Q") and "Wikidata" not in out["sources"]
+                          else source_url(ctx["qid"]))
             shared = [g for g in shared if g is not main]
         else:
             rels = [dict(r) for r in self.db.execute(
@@ -161,7 +197,7 @@ class Store:
             rels.sort(key=lambda r: (r["category"] not in cats, RELATION_PRIORITY.index(r["type"])))
             rel = rels[0]
             out = {"kind": "relation", "category": rel["category"], "type": rel["type"],
-                   "sentence": relation_sentence(rel, A, B)}
+                   "sentence": relation_sentence(rel, A, B), "sources": _sources(rel["source"]), "url": None}
         out["category_label"] = CATEGORY_LABEL[out["category"]]
         out["also"] = {"count": len(shared), "items": [g["title"] for g in shared[:4]]}
         return out
@@ -249,6 +285,12 @@ def _mini(p: dict) -> dict:
     return {k: p.get(k) for k in ("qid", "name", "description", "years", "image_url")}
 
 
+def _sources(*values) -> list:
+    """'wikidata,musicbrainz' (one value per membership/relation) -> ['Wikidata', 'MusicBrainz']"""
+    seen = dict.fromkeys(x for v in values for x in (v or "").split(",") if x)
+    return [SOURCE_LABEL[x] for x in SOURCE_LABEL if x in seen]
+
+
 # ---------------------------------------------------------------- sentences
 
 def context_title(c: dict) -> str:
@@ -291,16 +333,25 @@ def context_sentence(ctx: dict, A: dict, B: dict, ra: set, rb: set, title: str =
                 return f"{a} directed {b} in {title}"
             if "director" in rb and ra & acting:
                 return f"{b} directed {a} in {title}"
-        if cat == "music" and "performer" in ra and "performer" in rb:
-            return f"{a} and {b} performed together on {title}"
-        if "author" in ra and "author" in rb:
+        if cat == "music" and ra & _PERFORM and rb & _PERFORM:
+            return f"{a} and {b} both performed on {title}"
+        if "lyricist" in ra and "composer" in rb and not ra & _MUSIC_WRITING - {"lyricist"}:
+            return f"{a} wrote the words and {b} the music of {title}"
+        if "lyricist" in rb and "composer" in ra and not rb & _MUSIC_WRITING - {"lyricist"}:
+            return f"{b} wrote the words and {a} the music of {title}"
+        if ra & _WRITING and rb & _WRITING:
             return f"{a} and {b} co-wrote {title}"
         return f"{a} ({_role(ra)}) and {b} ({_role(rb)}) both worked on {title}"
     if kind == "authored":
         return f"{a} and {b} co-authored “{ctx['name']}”" + (f" ({ctx['year']})" if ctx.get("year") else "")
     if kind == "group":
-        if cat == "music":
+        band = {"member", "founder"}
+        if cat == "music" and ra & band and rb & band:
             return f"{a} and {b} were bandmates in {ctx['name']}"
+        if cat == "music" and "collaborator" in ra and "collaborator" in rb:   # a duo's joint credit
+            return f"{a} and {b} performed together as {ctx['name']}"
+        if cat == "music":
+            return f"{a} ({_role(ra)}) and {b} ({_role(rb)}) both played in {_the(ctx['name'])}"
         if cat == "family":
             return f"{a} and {b} are both members of {_the(ctx['name'])}"
         return f"{a} and {b} were both members of {_the(ctx['name'])}"
@@ -336,13 +387,23 @@ def context_sentence(ctx: dict, A: dict, B: dict, ra: set, rb: set, title: str =
     return f"{a} and {b} are both connected to {title}"
 
 
+_PERFORM = {"performer", "instrument", "vocal", "conductor", "chorus master", "concertmaster"}
+_MUSIC_WRITING = {"composer", "lyricist", "writer", "librettist"}
+_WRITING = _MUSIC_WRITING | {"author"}
+# MusicBrainz credit names as they read in "(role)"
+_ROLE_LABEL = {"vocal": "vocals", "instrument": "musician", "recording": "recording engineer",
+               "mix": "mixing engineer", "programming": "programmer", "writer": "songwriter"}
+
+
 def _role(roles: set) -> str:
     order = ["director", "cast member", "voice actor", "screenwriter", "producer", "performer", "composer",
-             "lyricist", "author", "creator", "illustrator", "editor"]
+             "lyricist", "author", "creator", "illustrator", "editor", "conductor", "vocal", "instrument", "writer",
+             "member", "founder", "supporting musician", "collaborator"]
     for r in order:
         if r in roles:
-            return r
-    return next(iter(sorted(roles)), "contributor") or "contributor"
+            return _ROLE_LABEL.get(r, r)
+    r = next(iter(sorted(x for x in roles if x)), "")
+    return _ROLE_LABEL.get(r, r) or "contributor"
 
 
 _DESCENDANT = re.compile(r"\b(child|children|son|daughter|grandchild|grandson|granddaughter|nephew|niece|descendant)\b", re.I)
@@ -389,6 +450,18 @@ def relation_sentence(rel: dict, A: dict, B: dict) -> str:
         return f"{s} was the doctoral advisor of {d}"
     if t == "teacher":
         return f"{s} taught {d}"
+    if t == "academic_advisor":
+        return f"{s} was an academic advisor of {d}"
+    if t == "coach":
+        return f"{s} coached {d}"
+    if t == "supporting":
+        return f"{s} was a supporting musician for {d}" + (f" ({detail})" if detail else "")
+    if t == "served_during":   # detail: the office dst held
+        return f"{s} served while {d} was {detail}"
+    if t == "deputy":
+        return f"{s} served as {detail} to {d}"
+    if t == "associated":
+        return f"{A['name']} and {B['name']} are listed as associated acts"
     if t == "influence":
         return f"{d} was influenced by {s}"
     if t == "partner_sport":

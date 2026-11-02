@@ -34,7 +34,7 @@ def cmd_fetch(args):
 def cmd_build(args):
     from sixdeg.build import build
     build(DATA, min_isolated_sitelinks=args.min_isolated_sitelinks, keep_stage=args.keep_stage,
-          reuse_stage=getattr(args, "reuse_stage", False))
+          reuse_stage=getattr(args, "reuse_stage", False), new_people=not args.wikidata_people_only)
 
 
 def cmd_update(args):
@@ -205,6 +205,8 @@ def main():
                        help="keep the intermediate stage.db (lets the next build use --reuse-stage)")
         p.add_argument("--reuse-stage", action="store_true",
                        help="skip loading the raw CSVs and reuse a kept stage.db")
+        p.add_argument("--wikidata-people-only", action="store_true",
+                       help="use MusicBrainz and dblp only for links between people who are in Wikidata")
 
     def fetch_opts(p):
         p.add_argument("--refresh", action="store_true", help="re-download even if cached")

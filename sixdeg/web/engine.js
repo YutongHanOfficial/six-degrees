@@ -117,7 +117,7 @@
     }
   }
 
-  const packs = Object.fromEntries(["cards", "links", "contexts", "qid", "search", "searchtop"].map((n) => [n, new Pack(n)]));
+  const packs = Object.fromEntries(["cards", "links", "contexts", "qid", "keys", "search", "searchtop"].map((n) => [n, new Pack(n)]));
 
   /* ---------------------------------------------------------- people */
 
@@ -128,17 +128,35 @@
     return `${b != null ? f(b) : "?"}–${f(d)}`;
   }
 
+  const SOURCE_LABEL = { wikidata: "Wikidata", wikipedia: "Wikipedia", musicbrainz: "MusicBrainz", dblp: "dblp" };
+  const KEY = /^(mb|dblp):\S+$/;   // people only in MusicBrainz or dblp
+  const DBLP_VENUES = new Set(["journals", "conf", "books", "series", "reference", "phd", "persons", "tr", "ms", "www", "dblpnote"]);
+
+  // The page of a person or context in the database it comes from (store.source_url)
+  function sourceUrl(key) {
+    if (key.startsWith("Q")) return "https://www.wikidata.org/wiki/" + key;
+    const i = key.indexOf(":"), src = key.slice(0, i), rest = key.slice(i + 1);
+    if (src === "mb") return "https://musicbrainz.org/" + (rest.includes("/") ? rest : "artist/" + rest);
+    if (src === "dblp") return DBLP_VENUES.has(rest.split("/")[0]) ? `https://dblp.org/rec/${rest}.html` : `https://dblp.org/pid/${rest}.html`;
+    if (src === "wp") return "https://en.wikipedia.org/wiki/" + encodeURIComponent(rest.replace(/ /g, "_")).replace(/%2F/g, "/");
+    return null;
+  }
+
   function makeCard(id, r) {
     const [q, name, desc, birth, death, gender, sitelinks, image, wiki, nRel, nCtx] = r;
     const enwiki = wiki === 0 ? null : wiki === 1 ? name : wiki;
+    const qid = typeof q === "number" ? "Q" + q : q;
     return {
-      id, qid: "Q" + q, name, description: desc || null, birth_year: birth, death_year: death,
+      id, qid, name, description: desc || null, birth_year: birth, death_year: death,
       gender: gender || null, sitelinks, image: image || null, enwiki, n_relations: nRel, n_contexts: nCtx,
       years: years(birth, death),
       // file names are stored URL-encoded already (as Wikidata gives them)
       image_url: image ? `https://commons.wikimedia.org/wiki/Special:FilePath/${image}?width=160` : null,
       wikipedia: enwiki ? "https://en.wikipedia.org/wiki/" + encodeURIComponent(enwiki.replace(/ /g, "_")).replace(/%2F/g, "/") : null,
-      wikidata: "https://www.wikidata.org/wiki/Q" + q,
+      wikidata: typeof q === "number" ? sourceUrl(qid) : null,
+      // people who are only in MusicBrainz or dblp: their page there
+      source: typeof q === "number" ? "Wikidata" : qid.startsWith("mb:") ? "MusicBrainz" : "dblp",
+      link: typeof q === "number" ? null : sourceUrl(qid),
     };
   }
 
@@ -155,8 +173,20 @@
 
   const mini = (p) => ({ qid: p.qid, name: p.name, description: p.description, years: p.years, image_url: p.image_url });
 
+  async function byKey(key) {
+    const ix = await packs.keys.index();
+    const i = countWhile(ix.first, (f) => cmp(f, key) <= 0) - 1;
+    if (i < 0) return null;
+    const [keys, ids] = await packs.keys.shard(i);
+    const j = keys.indexOf(key);
+    return j >= 0 ? card(ids[j]) : null;
+  }
+
+  // a person by Wikidata id ("Q76") or by key ("mb:<id>", "dblp:<id>")
   async function byQid(text) {
-    const m = /^[Qq](\d+)$/.exec(String(text || "").trim());
+    text = String(text || "").trim();
+    if (KEY.test(text)) return byKey(text);
+    const m = /^[Qq](\d+)$/.exec(text);
     if (!m) return null;
     const q = Number(m[1]);
     const ix = await packs.qid.index();
@@ -203,7 +233,7 @@
   async function search(text, limit = 8) {
     text = String(text || "").trim();
     if (!text) return [];
-    if (/^[Qq]\d+$/.test(text)) {
+    if (/^[Qq]\d+$/.test(text) || KEY.test(text)) {
       const p = await byQid(text);
       return p ? [p] : [];
     }
@@ -256,9 +286,9 @@
     const keys = m.categories.map((c) => c.key);
     let w = 0;
     return {
-      rels: r[0].map(([other, type, isA, cat, year, detail]) => (
-        { other, type: m.relation_types[type], prio: type, isA: !!isA, category: keys[cat], year, detail })),
-      mems: r[1].map(([d, role, fold]) => ({ ctx: (w += d), role: m.roles[role], fold: fold || 0 })),
+      rels: r[0].map(([other, type, isA, cat, year, detail, src]) => (
+        { other, type: m.relation_types[type], prio: type, isA: !!isA, category: keys[cat], year, detail, src: src || 1 })),
+      mems: r[1].map(([d, role, fold, src]) => ({ ctx: (w += d), role: m.roles[role], fold: fold || 0, src: src || 1 })),
     };
   }
 
@@ -270,7 +300,8 @@
   async function contextOf(w) {
     const [m, r] = await Promise.all([meta(), packs.contexts.get(w)]);
     const [kind, q, name, year, period, sitelinks, size, first] = r;
-    return { id: w, kind: m.kinds[kind], category: categoryOf(m, w), qid: "Q" + q, name, year, period, sitelinks, size, first };
+    const qid = typeof q === "number" ? "Q" + q : q;
+    return { id: w, kind: m.kinds[kind], category: categoryOf(m, w), qid, name, year, period, sitelinks, size, first };
   }
 
   const groupTitle = (c, periods) =>
@@ -297,9 +328,12 @@
   }
 
   const roleSet = (l, ctx) => new Set((l.mems.find((x) => x.ctx === ctx)?.role || "").split(","));
+  const srcOf = (l, ctx) => l.mems.find((x) => x.ctx === ctx)?.src || 0;
+  // ["Wikidata", "MusicBrainz"] from a source mask (bit i = meta.sources[i])
+  const sourceNames = (m, mask) => m.sources.filter((_, i) => mask & (1 << i)).map((k) => SOURCE_LABEL[k]);
 
   async function explainLink(a, b, via, cats, cardsP, labels) {
-    const [la, lb] = await Promise.all([linksOf(a), linksOf(b)]);
+    const [la, lb, m] = await Promise.all([linksOf(a), linksOf(b), meta()]);
     let shared = await sharedGroups(a, b, cats, la, lb);
     const [ctx, cards] = await Promise.all([via >= 0 ? contextOf(via) : null, cardsP]);
     const A = cards.get(a), B = cards.get(b);
@@ -311,6 +345,10 @@
         kind: "context", category: ctx.category,
         sentence: contextSentence(ctx, A, B, roleSet(la, via), roleSet(lb, via), title),
         context: { qid: ctx.qid, name: ctx.name, year: ctx.year, kind: ctx.kind, period: ctx.period, size: ctx.size },
+        sources: sourceNames(m, srcOf(la, via) | srcOf(lb, via)),
+        // the record to check it against: the context's own page, unless that is a Wikidata item and
+        // Wikidata isn't among the sources
+        url: ctx.qid.startsWith("Q") && !((srcOf(la, via) | srcOf(lb, via)) & 1) ? null : sourceUrl(ctx.qid),
       };
       shared = shared.filter((g) => g !== main);
     } else {
@@ -320,6 +358,7 @@
       out = {
         kind: "relation", category: r.category, type: r.type,
         sentence: relationSentence({ type: r.type, a_id: r.isA ? a : b, detail: r.detail, year: r.year }, A, B),
+        sources: sourceNames(m, r.src || 1), url: null,
       };
     }
     out.category_label = labels[out.category];
@@ -532,7 +571,8 @@
     "declaration|charter|constitution|manifesto|petition|resolution|convention|congress|council|summit|" +
     "assembly|parliament|senate|committee|commission|society|academy|club|party|group|family|dynasty|house|" +
     "games|olympics|cup|championships?|tournament|final|race|marathon|grand prix|open|trophy|league|" +
-    "award|prize|medal|order|cross|honou?rs|expedition|festival|referendum|debate|primary|caucus)\\b", "i");
+    "award|prize|medal|order|cross|honou?rs|expedition|festival|referendum|debate|primary|caucus|" +
+    "orchestra|choir|ensemble|quartet|philharmonic)\\b", "i");
 
   function the(name) {
     if (name.toLowerCase().startsWith("the ")) return name;
@@ -562,17 +602,26 @@
     }).join(", ");
   }
 
+  const PERFORM = new Set(["performer", "instrument", "vocal", "conductor", "chorus master", "concertmaster"]);
+  const MUSIC_WRITING = new Set(["composer", "lyricist", "writer", "librettist"]);
+  const WRITING = new Set([...MUSIC_WRITING, "author"]);
+  // MusicBrainz credit names as they read in "(role)"
+  const ROLE_LABEL = { vocal: "vocals", instrument: "musician", recording: "recording engineer", mix: "mixing engineer",
+                       programming: "programmer", writer: "songwriter" };
+
   function role(roles) {
     for (const r of ["director", "cast member", "voice actor", "screenwriter", "producer", "performer", "composer",
-                     "lyricist", "author", "creator", "illustrator", "editor"]) {
-      if (roles.has(r)) return r;
+                     "lyricist", "author", "creator", "illustrator", "editor", "conductor", "vocal", "instrument", "writer",
+                     "member", "founder", "supporting musician", "collaborator"]) {
+      if (roles.has(r)) return ROLE_LABEL[r] || r;
     }
-    return [...roles].sort()[0] || "contributor";
+    const r = [...roles].filter(Boolean).sort()[0] || "";
+    return ROLE_LABEL[r] || r || "contributor";
   }
 
   function contextSentence(ctx, A, B, ra, rb, title) {
     const a = A.name, b = B.name, kind = ctx.kind, cat = ctx.category;
-    const any = (set, xs) => xs.some((x) => set.has(x));
+    const any = (set, xs) => [...xs].some((x) => set.has(x));
     title = title || contextTitle(ctx);
     let when = title.startsWith(ctx.name) ? title.slice(ctx.name.length).trim() : "";
     if (kind === "work") {
@@ -582,13 +631,19 @@
         if (ra.has("director") && any(rb, acting)) return `${a} directed ${b} in ${title}`;
         if (rb.has("director") && any(ra, acting)) return `${b} directed ${a} in ${title}`;
       }
-      if (cat === "music" && ra.has("performer") && rb.has("performer")) return `${a} and ${b} performed together on ${title}`;
-      if (ra.has("author") && rb.has("author")) return `${a} and ${b} co-wrote ${title}`;
+      if (cat === "music" && any(ra, PERFORM) && any(rb, PERFORM)) return `${a} and ${b} both performed on ${title}`;
+      const onlyLyrics = (set) => set.has("lyricist") && ![...MUSIC_WRITING].some((x) => x !== "lyricist" && set.has(x));
+      if (onlyLyrics(ra) && rb.has("composer")) return `${a} wrote the words and ${b} the music of ${title}`;
+      if (onlyLyrics(rb) && ra.has("composer")) return `${b} wrote the words and ${a} the music of ${title}`;
+      if (any(ra, WRITING) && any(rb, WRITING)) return `${a} and ${b} co-wrote ${title}`;
       return `${a} (${role(ra)}) and ${b} (${role(rb)}) both worked on ${title}`;
     }
     if (kind === "authored") return `${a} and ${b} co-authored “${ctx.name}”` + (ctx.year ? ` (${ctx.year})` : "");
     if (kind === "group") {
-      if (cat === "music") return `${a} and ${b} were bandmates in ${ctx.name}`;
+      const band = ["member", "founder"];
+      if (cat === "music" && any(ra, band) && any(rb, band)) return `${a} and ${b} were bandmates in ${ctx.name}`;
+      if (cat === "music" && ra.has("collaborator") && rb.has("collaborator")) return `${a} and ${b} performed together as ${ctx.name}`;
+      if (cat === "music") return `${a} (${role(ra)}) and ${b} (${role(rb)}) both played in ${the(ctx.name)}`;
       if (cat === "family") return `${a} and ${b} are both members of ${the(ctx.name)}`;
       return `${a} and ${b} were both members of ${the(ctx.name)}`;
     }
@@ -646,6 +701,12 @@
       case "godparent": return `${s} is the ${gendered(src.gender, "godfather", "godmother", "godparent")} of ${d}`;
       case "advisor": return `${s} was the doctoral advisor of ${d}`;
       case "teacher": return `${s} taught ${d}`;
+      case "academic_advisor": return `${s} was an academic advisor of ${d}`;
+      case "coach": return `${s} coached ${d}`;
+      case "supporting": return `${s} was a supporting musician for ${d}` + (detail ? ` (${detail})` : "");
+      case "served_during": return `${s} served while ${d} was ${detail}`;
+      case "deputy": return `${s} served as ${detail} to ${d}`;
+      case "associated": return `${A.name} and ${B.name} are listed as associated acts`;
       case "influence": return `${d} was influenced by ${s}`;
       case "partner_sport": return `${A.name} and ${B.name} were partners in sport or business`;
       case "significant": return `${d} was a significant person for ${s}` + (detail ? ` (${detail})` : "");

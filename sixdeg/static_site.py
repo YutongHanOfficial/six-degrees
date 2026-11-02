@@ -13,13 +13,15 @@ does that to .bin, and a byte range of the compressed copy is useless to the pag
 
 Packs, each sharded by its key:
   cards      person id -> [qid, name, description, birth, death, gender, sitelinks, image, enwiki,
-             n_relations, n_contexts]
+             n_relations, n_contexts]   (qid: the Wikidata number, or the key of someone who is only
+             in another source, e.g. "mb:<MusicBrainz id>", "dblp:<dblp id>")
   links      person id -> 0 | [relations, memberships]: everything needed to explain a link or
-             list someone's connections
+             list someone's connections, with the sources that record it (bits of SOURCES)
   contexts   context id -> [kind, qid, name, year, period, sitelinks, size, first five members]
   search     name index: [token, person ids, the other words of that name or alias] groups
   searchtop  best matches for name-index ranges too big to scan ("jo", "john", "smith")
   qid        Wikidata number -> person id
+  keys       key of someone only in another source -> person id
 
 Context ids are renumbered: grouped by category, best known first, a team's seasons together.
 The graph renumbers people again, densely over the 4 million who have any link at all.
@@ -27,7 +29,6 @@ The graph renumbers people again, densely over the 4 million who have any link a
 from __future__ import annotations
 
 import array
-import csv
 import gzip
 import hashlib
 import io
@@ -55,6 +56,17 @@ TOP_N = 10                     # best matches kept for very common names and pre
 BIG_RANGE = 1500               # name-index ranges with more entries than this get them
 CAT_KEYS = [k for k, _ in CATEGORIES]
 REL_CODE = {t: i for i, t in enumerate(RELATION_PRIORITY)}
+SOURCES = ["wikidata", "wikipedia", "musicbrainz", "dblp"]   # bit i of a link's source mask
+
+
+def source_mask(value) -> int:
+    """'wikipedia,musicbrainz' -> 0b110"""
+    return sum(1 << SOURCES.index(x) for x in set((value or "wikidata").split(",")) if x in SOURCES) or 1
+
+
+def qkey(qid: str):
+    """'Q76' -> 76; anything else (a key in another source) stays a string."""
+    return int(qid[1:]) if qid[:1] == "Q" and qid[1:].isdigit() else qid
 
 
 def log(msg):
@@ -200,11 +212,17 @@ class Contexts:
         self.sl = np.empty(C, np.int64)
         self.size = np.empty(C, np.int64)
         self.names = [None] * C
+        self.keys = {}                            # db id -> key, for contexts only in another source
         kind_code = {k: i for i, k in enumerate(KINDS)}
         cat_code = {k: i for i, k in enumerate(CAT_KEYS)}
         for cid, qid, kind, cat, name, year, period, sl, size in con.execute(
                 "SELECT id, qid, kind, category, name, year, period, sitelinks, size FROM context ORDER BY id"):
-            self.qnum[cid] = int(qid[1:])
+            q = qkey(qid)
+            if isinstance(q, int):
+                self.qnum[cid] = q
+            else:
+                self.qnum[cid] = 0
+                self.keys[cid] = q
             self.kind[cid] = kind_code[kind]
             self.cat[cid] = cat_code[cat]
             if year is not None:
@@ -299,30 +317,37 @@ def export_graph(con, graph_dir: str, ctx: Contexts, out_dir: str) -> dict:
 # ---------------------------------------------------------------- people
 
 def export_cards(con, out_dir: str):
-    """Person cards in id order; also returns each person's qid number (for the qid pack)."""
+    """Person cards in id order; also returns each person's qid number (for the qid pack, -1 for
+    people only in another source) and those people's keys (for the keys pack)."""
     P = con.execute("SELECT COUNT(*) FROM person").fetchone()[0]
-    qnums = np.empty(P, np.int64)
+    qnums = np.full(P, -1, np.int64)
+    keys = []
     linked = np.zeros(P, bool)
     sharder = Sharder(Pack(out_dir, "cards"), 24_000)
     gender = {"m": "m", "f": "f"}
     for (pid, qid, name, desc, birth, death, g, sl, image, enwiki, n_rel, n_ctx) in con.execute(
             "SELECT id, qid, name, description, birth_year, death_year, gender, sitelinks, image, enwiki, "
             "n_relations, n_contexts FROM person ORDER BY id"):
-        q = qnums[pid] = int(qid[1:])
+        q = qkey(qid)
+        if isinstance(q, int):
+            qnums[pid] = q
+        else:
+            keys.append((q, pid))
         linked[pid] = n_rel + n_ctx > 0
         if desc and (birth is not None or death is not None):
             desc = _YEARS_SUFFIX.sub("", desc) or desc
         wiki = 0 if not enwiki else 1 if enwiki == name else enwiki
         sharder.add(pid, [q, name, desc or "", birth, death, gender.get(g, ""), sl, image or "", wiki, n_rel, n_ctx])
-    return sharder.close(), qnums, linked
+    return sharder.close(), qnums, keys, linked
 
 
 def export_links(con, ctx: Contexts, out_dir: str):
     """Each person's relations and memberships, in the order the person panel lists them."""
     P = con.execute("SELECT COUNT(*) FROM person").fetchone()[0]
     roles, role_code = [], {}
-    mp, mc, mr = array.array("q"), array.array("q"), array.array("q")
-    for p, c, r in con.execute("SELECT person_id, context_id, role FROM membership"):
+    mp, mc, mr, ms = array.array("q"), array.array("q"), array.array("q"), array.array("q")
+    masks = {}
+    for p, c, r, src in con.execute("SELECT person_id, context_id, role, source FROM membership"):
         code = role_code.get(r)
         if code is None:
             code = role_code[r] = len(roles)
@@ -330,20 +355,26 @@ def export_links(con, ctx: Contexts, out_dir: str):
         mp.append(p)
         mc.append(c)
         mr.append(code)
+        m = masks.get(src)
+        if m is None:
+            m = masks[src] = source_mask(src)
+        ms.append(m)
     mp, mc, mr = np.frombuffer(mp, np.int64), np.frombuffer(mc, np.int64), np.frombuffer(mr, np.int64)
+    ms = np.frombuffer(ms, np.int64)
     wc = ctx.web[mc]
     o = np.lexsort((wc, mp))
-    mp, wc, mr, mf = mp[o], wc[o], mr[o], np.where(ctx.folded[mc[o]], ctx.qnum[mc[o]], 0)
+    mp, wc, mr, ms, mf = mp[o], wc[o], mr[o], ms[o], np.where(ctx.folded[mc[o]], ctx.qnum[mc[o]], 0)
     m_ptr = np.searchsorted(mp, np.arange(P + 1))
 
-    ra, rb, rt, rc, ry, rd = [array.array("q") for _ in range(5)] + [[]]
+    ra, rb, rt, rc, ry, rs, rd = [array.array("q") for _ in range(6)] + [[]]
     cat_code = {k: i for i, k in enumerate(CAT_KEYS)}
-    for a, b, t, c, d, y in con.execute("SELECT a_id, b_id, type, category, detail, year FROM relation"):
+    for a, b, t, c, d, y, src in con.execute("SELECT a_id, b_id, type, category, detail, year, source FROM relation"):
         ra.append(a)
         rb.append(b)
         rt.append(REL_CODE[t])
         rc.append(cat_code[c])
         ry.append(y if y is not None else -(10 ** 9))
+        rs.append(source_mask(src))
         rd.append(d)
     ra, rb, rt = np.frombuffer(ra, np.int64), np.frombuffer(rb, np.int64), np.frombuffer(rt, np.int64)
     R = ra.size
@@ -354,7 +385,7 @@ def export_links(con, ctx: Contexts, out_dir: str):
     o = np.lexsort((other, rt[idx], end))
     end, other, idx, is_a = end[o], other[o], idx[o], is_a[o]
     r_ptr = np.searchsorted(end, np.arange(P + 1))
-    rc, ry = np.frombuffer(rc, np.int64), np.frombuffer(ry, np.int64)
+    rc, ry, rs = np.frombuffer(rc, np.int64), np.frombuffer(ry, np.int64), np.frombuffer(rs, np.int64)
 
     sharder = Sharder(Pack(out_dir, "links"), 24_000)
     block = 8192
@@ -362,18 +393,24 @@ def export_links(con, ctx: Contexts, out_dir: str):
         hi = min(P, lo + block)
         r0, r1, m0, m1 = int(r_ptr[lo]), int(r_ptr[hi]), int(m_ptr[lo]), int(m_ptr[hi])
         R_other, R_idx, R_isa = other[r0:r1].tolist(), idx[r0:r1].tolist(), is_a[r0:r1].tolist()
-        M_w, M_r, M_f = wc[m0:m1].tolist(), mr[m0:m1].tolist(), mf[m0:m1].tolist()
+        M_w, M_r, M_f, M_s = wc[m0:m1].tolist(), mr[m0:m1].tolist(), mf[m0:m1].tolist(), ms[m0:m1].tolist()
         rp, mpp = (r_ptr[lo:hi + 1] - r0).tolist(), (m_ptr[lo:hi + 1] - m0).tolist()
         for i in range(hi - lo):
             rels = []
             for j in range(rp[i], rp[i + 1]):
                 k = R_idx[j]
                 y = int(ry[k])
-                rels.append([R_other[j], int(rt[k]), R_isa[j], int(rc[k]), y if y > -(10 ** 9) else None, rd[k]])
+                rel = [R_other[j], int(rt[k]), R_isa[j], int(rc[k]), y if y > -(10 ** 9) else None, rd[k]]
+                if rs[k] != 1:      # sources other than Wikidata alone
+                    rel.append(int(rs[k]))
+                rels.append(rel)
             mems, prev = [], 0
             for j in range(mpp[i], mpp[i + 1]):
                 w = M_w[j]
-                mems.append([w - prev, M_r[j], M_f[j]] if M_f[j] else [w - prev, M_r[j]])
+                mem = [w - prev, M_r[j], M_f[j], M_s[j]]
+                while len(mem) > 2 and mem[-1] == (1 if len(mem) == 4 else 0):   # drop default fold 0 / source 1
+                    mem.pop()
+                mems.append(mem)
                 prev = w
             sharder.add(lo + i, [rels, mems] if rels or mems else 0)
     return sharder.close(), roles
@@ -385,7 +422,7 @@ def export_contexts(ctx: Contexts, graph_dir: str, out_dir: str) -> dict:
     order = ctx.order.tolist()
     for w, c in enumerate(order):
         s = int(cp_ptr[c])
-        sharder.add(w, [int(ctx.kind[c]), int(ctx.qnum[c]), ctx.names[c],
+        sharder.add(w, [int(ctx.kind[c]), ctx.keys.get(c) or int(ctx.qnum[c]), ctx.names[c],
                         int(ctx.year[c]) if ctx.has_year[c] else None,
                         int(ctx.period[c]) if ctx.has_period[c] else None,
                         int(ctx.sl[c]), int(ctx.size[c]), cp_per[s:min(s + 5, int(cp_ptr[c + 1]))].tolist()])
@@ -394,6 +431,7 @@ def export_contexts(ctx: Contexts, graph_dir: str, out_dir: str) -> dict:
 
 def export_qids(qnums: np.ndarray, out_dir: str) -> dict:
     o = np.argsort(qnums, kind="stable")
+    o = o[qnums[o] >= 0]
     q, ids = qnums[o], o
     pack = Pack(out_dir, "qid")
     for lo in range(0, q.size, 4096):
@@ -402,9 +440,19 @@ def export_qids(qnums: np.ndarray, out_dir: str) -> dict:
     return pack.close()
 
 
+def export_keys(keys: list, out_dir: str) -> dict:
+    """Keys of people who are only in another source, in code point order (as the engine compares)."""
+    keys.sort()
+    pack = Pack(out_dir, "keys")
+    for lo in range(0, len(keys), 2048):
+        chunk = keys[lo:lo + 2048]
+        pack.write(chunk[0][0], _json([[k for k, _ in chunk], [i for _, i in chunk]]))
+    return pack.close()
+
+
 # ---------------------------------------------------------------- name index
 
-def export_search(con, raw_dir: str, qnums: np.ndarray, tmp_path: str, out_dir: str) -> dict:
+def export_search(con, tmp_path: str, out_dir: str) -> dict:
     """Entries (token, person, the other tokens of that name/alias), sorted by token then person.
     A query is answered from the entries of one of its words: the others are checked against the
     words stored alongside. Persons are ranked by id, i.e. best known first."""
@@ -415,20 +463,8 @@ def export_search(con, raw_dir: str, qnums: np.ndarray, tmp_path: str, out_dir: 
                       "CREATE TABLE e(t TEXT NOT NULL, id INTEGER NOT NULL, o TEXT NOT NULL);")
 
     aliases = {}
-    path = os.path.join(raw_dir, "people_alias.csv.gz")
-    if os.path.exists(path):
-        order = np.argsort(qnums)
-        sq = qnums[order]
-        with gzip.open(path, "rt", encoding="utf-8", newline="") as f:
-            rows = csv.reader(f)
-            next(rows, None)
-            for row in rows:
-                if len(row) < 2 or not row[0].startswith("Q"):
-                    continue
-                q = int(row[0][1:])
-                i = int(np.searchsorted(sq, q))
-                if i < sq.size and sq[i] == q:
-                    aliases.setdefault(int(order[i]), []).append(row[1])
+    for pid, alias in con.execute("SELECT person_id, alias FROM alias"):
+        aliases.setdefault(pid, []).append(alias)
     log(f"  name index: {sum(map(len, aliases.values())):,} aliases for {len(aliases):,} people")
 
     batch = []
@@ -557,16 +593,16 @@ def export_site(data_dir: str, out_dir: str, web: bool = True) -> None:
     log("graph")
     graph = export_graph(con, graph_dir, ctx, data_out)
     log("cards")
-    cards, qnums, linked = export_cards(con, data_out)
+    cards, qnums, keys, linked = export_cards(con, data_out)
     log("links")
     links, roles = export_links(con, ctx, data_out)
     log("contexts pack")
     contexts = export_contexts(ctx, graph_dir, data_out)
     log("qid index")
     qid = export_qids(qnums, data_out)
+    keys = export_keys(keys, data_out)
     log("name index")
-    search = export_search(con, os.path.join(data_dir, "raw"), qnums,
-                           os.path.join(data_dir, "site-index.tmp.db"), data_out)
+    search = export_search(con, os.path.join(data_dir, "site-index.tmp.db"), data_out)
     con.close()
 
     version = re.sub(r"\D", "", meta.get("built_at", "")) or str(int(time.time()))
@@ -581,8 +617,9 @@ def export_site(data_dir: str, out_dir: str, web: bool = True) -> None:
         "kinds": KINDS,
         "relation_types": RELATION_PRIORITY,
         "roles": roles,
+        "sources": SOURCES,
         "graph": graph,
-        "packs": {"cards": cards, "links": links, "contexts": contexts, "qid": qid,
+        "packs": {"cards": cards, "links": links, "contexts": contexts, "qid": qid, "keys": keys,
                   "search": search["search"], "searchtop": search["searchtop"]},
         "top_n": search["top_n"],
         # "Surprise me" picks two of the 3,000 best-known people who have at least one link

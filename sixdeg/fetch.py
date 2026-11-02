@@ -1,4 +1,5 @@
-"""Download step: run every bulk Wikidata query once and cache the CSVs under data/raw/."""
+"""Download step: run every bulk Wikidata query once and cache the CSVs under data/raw/, then the
+other sources (Wikipedia infoboxes via DBpedia, MusicBrainz, dblp)."""
 from __future__ import annotations
 
 import os
@@ -32,6 +33,16 @@ def fetch_all(raw_dir: str, refresh: bool = False, only=None, log=print) -> None
             continue
         size = os.path.getsize(dest) / 1e6
         log(f"    {rows:,} rows, {size:.1f} MB in {time.time() - t0:.0f}s")
+    from . import dbpedia, dblp, musicbrainz   # (they import raw_path from here)
+    for name, source in (("dbpedia", dbpedia), ("musicbrainz", musicbrainz), ("dblp", dblp)):
+        if only and not any(name.startswith(o) or o.startswith(name) for o in only):
+            continue
+        log(f"[{name}]")
+        try:
+            source.fetch(raw_dir, refresh)
+        except (OSError, SystemExit, sparql.QueryError) as e:
+            log(f"    FAILED: {e}")
+            failed.append(name)
     log(f"fetch finished in {time.time() - t_all:.0f}s")
     if failed:
         raise SystemExit("queries failed: " + ", ".join(failed) + " (re-run to retry just these)")

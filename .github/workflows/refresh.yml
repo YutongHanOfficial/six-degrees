@@ -1,8 +1,8 @@
-# Rebuilds the site from fresh Wikidata data once a month and publishes it to GitHub Pages:
-# the same `update`, `site` and `deploy` steps as by hand, plus the browser-vs-Python tests and a
-# check that the new data isn't much smaller than what is live. If any step fails, the live site
-# is left as it was (and GitHub emails you). Run it by hand from the Actions tab: "Monthly data
-# refresh" -> "Run workflow". It takes about 40 minutes.
+# Rebuilds the site from fresh Wikidata, Wikipedia (DBpedia), MusicBrainz and dblp data once a
+# month and publishes it to GitHub Pages: the same `fetch`, `build`, `site` and `deploy` steps as
+# by hand, plus the browser-vs-Python tests and a check that the new data isn't much smaller than
+# what is live. If any step fails, the live site is left as it was (and GitHub emails you). Run it
+# by hand from the Actions tab: "Monthly data refresh" -> "Run workflow". It takes about 2 hours.
 name: Monthly data refresh
 
 on:
@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Make room on disk
-        # the build needs about 12 GB at its peak; these preinstalled toolchains free ~25 GB
+        # the build needs about 18 GB at its peak; these preinstalled toolchains free ~25 GB
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h .
@@ -43,8 +43,8 @@ jobs:
           node-version: "22"
       - run: pip install numpy
 
-      - name: Download from Wikidata
-        # resumable: a retry only re-runs the queries that failed
+      - name: Download from Wikidata, DBpedia, MusicBrainz and dblp
+        # resumable: a retry only re-runs the queries and downloads that failed
         run: |
           for attempt in 1 2 3; do
             python3 sixdeg.py fetch && exit 0
@@ -54,7 +54,9 @@ jobs:
           exit 1
 
       - name: Build the database
-        run: python3 sixdeg.py build
+        # Only links between people on Wikidata: also adding everyone else in MusicBrainz and dblp
+        # (about 5 million more people) would take the site past GitHub Pages' 1 GB limit.
+        run: python3 sixdeg.py build --wikidata-people-only
 
       - name: Export the website
         run: python3 sixdeg.py site
